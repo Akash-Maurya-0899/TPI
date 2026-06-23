@@ -33,7 +33,12 @@ MP 02/2017
 import pytest
 import numpy as np
 import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import TPI
+import TPI_jax
 
 def test_BsplineBasis1D():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12])
@@ -93,6 +98,28 @@ def test_BsplineBasis1D_fail():
     # with pytest.raises(ValueError):
     #     x2 = np.array([1.1, "-3.4", 5.1, 7.2, 9.3, 12])
     #     TPI.BsplineBasis1D(x2)
+
+
+def test_jax_construct_knots_matches_gsl():
+    grids_and_knots = [
+        (
+            np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0]),
+            np.array([1.1, 1.1, 1.1, 1.1, 3.2, 5.1, 7.2, 9.3, 12.0, 12.0, 12.0, 12.0]),
+        ),
+        (
+            np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25]),
+            np.array([0.1, 0.1, 0.1, 0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25, 0.25, 0.25, 0.25]),
+        ),
+        (
+            np.array([-1.0, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0]),
+            np.array([-1.0, -1.0, -1.0, -1.0, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0, 1.0, 1.0, 1.0]),
+        ),
+    ]
+
+    for nodes, expected_knots in grids_and_knots:
+        knots = TPI_jax.construct_knots(nodes)
+        assert np.array_equal(np.asarray(knots), expected_knots)
+        assert np.asarray(knots).dtype == np.float64
 
 
 def test_SplineMatrix():

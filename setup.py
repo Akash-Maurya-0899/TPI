@@ -106,6 +106,7 @@ if USE_CYTHON:
 setup(
     name="TPI",
     version=VERSION,
+    py_modules=["TPI_jax"],
     ext_modules=extensions,
     author="Michael Pürrer, Jonathan Blackman",
     author_email="Michael.Puerrer@gmail.com",
@@ -115,4 +116,3 @@ setup(
     install_requires=SETUP_REQUIRES,
     url="https://github.com/mpuerrer/TPI"
 )
-

@@ -253,7 +253,7 @@ cdef class TP_Interpolant_ND:
         self.knots_list = knots_list
 
         # pad boundaries with zeroes since we have 2 more equations with the not-a-knot conditions than data
-        F0 = np.lib.arraypad.pad(F, 1, 'constant')
+        F0 = np.pad(F, 1, 'constant')
 
         # Solve a sequence of linear systems to obtain coefficient tensor
         tmp_result = F0
