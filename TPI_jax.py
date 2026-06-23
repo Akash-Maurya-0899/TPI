@@ -47,6 +47,68 @@ def _construct_knots_jax(nodes):
     return jnp.concatenate((start, nodes, end))
 
 
+def _evaluate_cubic_bspline_basis_jax(knots, x):
+    """Evaluate the full cubic B-spline basis on a clamped knot vector."""
+    knots = jnp.asarray(knots, dtype=jnp.float64)
+    x = jnp.asarray(x, dtype=jnp.float64)
+
+    # Degree-0 basis functions live on the knot spans.
+    basis = jnp.where((knots[:-1] <= x) & (x < knots[1:]), 1.0, 0.0)
+    basis = basis.at[-1].set(jnp.where(x == knots[-1], 1.0, basis[-1]))
+
+    # Recursively elevate from degree 0 to degree 3.
+    for degree in range(1, 4):
+        next_basis = []
+        for i in range(basis.shape[0] - 1):
+            left_denom = knots[i + degree] - knots[i]
+            right_denom = knots[i + degree + 1] - knots[i + 1]
+
+            left_safe = jnp.where(left_denom == 0.0, 1.0, left_denom)
+            right_safe = jnp.where(right_denom == 0.0, 1.0, right_denom)
+
+            left = jnp.where(
+                left_denom != 0.0,
+                (x - knots[i]) / left_safe * basis[i],
+                0.0,
+            )
+            right = jnp.where(
+                right_denom != 0.0,
+                (knots[i + degree + 1] - x) / right_safe * basis[i + 1],
+                0.0,
+            )
+            next_basis.append(left + right)
+
+        basis = jnp.stack(next_basis)
+
+    basis = jnp.where(x == knots[-1], basis.at[-1].set(1.0), basis)
+    return basis
+
+
+class BsplineBasis1D:
+    """JAX-side 1D cubic B-spline basis helper."""
+
+    def __init__(self, xvec_in):
+        self.xi = _as_valid_nodes(xvec_in)
+        self.knots = _construct_knots_jax(self.xi)
+        self.nbasis = int(self.knots.shape[0] - 4)
+
+    def EvaluateBsplines(self, x):
+        x_arr = np.asarray(x, dtype=np.float64)
+        if x_arr.ndim != 0:
+            raise ValueError("Evaluation point x must be scalar.")
+
+        x_val = float(x_arr)
+        x_min = float(np.asarray(self.xi[0]))
+        x_max = float(np.asarray(self.xi[-1]))
+        if x_val < x_min or x_val > x_max:
+            raise ValueError(
+                f"Error: Bspline_basis_1D(): x: {x_val} is outside of knots "
+                f"vector with bounds [{x_min}, {x_max}]!"
+            )
+
+        return _evaluate_cubic_bspline_basis_jax(self.knots, x_val)
+
+
 def construct_knots(nodes):
     """Construct the cubic B-spline knot vector matching GSL's convention."""
     nodes_array = _as_valid_nodes(nodes)

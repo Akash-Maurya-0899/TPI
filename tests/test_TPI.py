@@ -122,6 +122,91 @@ def test_jax_construct_knots_matches_gsl():
         assert np.asarray(knots).dtype == np.float64
 
 
+def test_jax_EvaluateBsplines_matches_gsl():
+    x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0])
+    basis = TPI_jax.BsplineBasis1D(x1)
+    cases = [
+        (
+            1.1,
+            np.array([1., 0., 0., 0., 0., 0., 0., 0.]),
+        ),
+        (
+            2.0,
+            np.array([
+                0.1865889212827989,
+                0.5871483236151605,
+                0.21203558882569423,
+                0.014227166276346603,
+                0.,
+                0.,
+                0.,
+                0.,
+            ]),
+        ),
+        (
+            4.7,
+            np.array([
+                0.,
+                0.00210526315789473,
+                0.2988222605694564,
+                0.6262726488352028,
+                0.07279982743744609,
+                0.,
+                0.,
+                0.,
+            ]),
+        ),
+        (
+            9.3,
+            np.array([
+                0.,
+                0.,
+                0.,
+                0.,
+                0.22010869565217378,
+                0.588485054347826,
+                0.1914062500000001,
+                0.,
+            ]),
+        ),
+        (
+            12.0,
+            np.array([0., 0., 0., 0., 0., 0., 0., 1.]),
+        ),
+    ]
+
+    actual_values = []
+    expected_values = []
+    diagnostics = []
+
+    for case_index, (x, expected) in enumerate(cases):
+        actual = np.asarray(basis.EvaluateBsplines(x))
+        assert actual.shape == expected.shape
+        actual_values.append(actual)
+        expected_values.append(expected)
+        diagnostics.extend([(case_index, x, basis_index) for basis_index in range(expected.size)])
+
+    actual_flat = np.concatenate(actual_values)
+    expected_flat = np.concatenate(expected_values)
+    diff = actual_flat - expected_flat
+    abs_diff = np.abs(diff)
+    rel_den = np.maximum(np.abs(expected_flat), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    max_abs_case, max_abs_x, max_abs_basis = diagnostics[max_abs_idx]
+    max_rel_case, max_rel_x, max_rel_basis = diagnostics[max_rel_idx]
+    print(
+        f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
+        f"at case {max_abs_case} (x={max_abs_x}, basis_index={max_abs_basis})"
+    )
+    print(
+        f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
+        f"at case {max_rel_case} (x={max_rel_x}, basis_index={max_rel_basis})"
+    )
+    assert np.allclose(actual_flat, expected_flat, atol=1e-10, rtol=0)
+
+
 def test_SplineMatrix():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12])
     b = TPI.BsplineBasis1D(x1)
