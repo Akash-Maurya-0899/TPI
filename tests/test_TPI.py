@@ -34,6 +34,7 @@ import pytest
 import numpy as np
 import os
 import sys
+import jax
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -175,36 +176,50 @@ def test_jax_EvaluateBsplines_matches_gsl():
         ),
     ]
 
-    actual_values = []
-    expected_values = []
     diagnostics = []
 
     for case_index, (x, expected) in enumerate(cases):
+        assert abs(expected.sum() - 1.0) < 1e-12
         actual = np.asarray(basis.EvaluateBsplines(x))
         assert actual.shape == expected.shape
-        actual_values.append(actual)
-        expected_values.append(expected)
-        diagnostics.extend([(case_index, x, basis_index) for basis_index in range(expected.size)])
+        diagnostics.extend(
+            [
+                (case_index, x, basis_index, actual[basis_index], expected[basis_index])
+                for basis_index in range(expected.size)
+            ]
+        )
 
-    actual_flat = np.concatenate(actual_values)
-    expected_flat = np.concatenate(expected_values)
+    actual_flat = np.array([entry[3] for entry in diagnostics])
+    expected_flat = np.array([entry[4] for entry in diagnostics])
     diff = actual_flat - expected_flat
     abs_diff = np.abs(diff)
     rel_den = np.maximum(np.abs(expected_flat), np.finfo(np.float64).tiny)
     rel_diff = abs_diff / rel_den
     max_abs_idx = int(np.argmax(abs_diff))
     max_rel_idx = int(np.argmax(rel_diff))
-    max_abs_case, max_abs_x, max_abs_basis = diagnostics[max_abs_idx]
-    max_rel_case, max_rel_x, max_rel_basis = diagnostics[max_rel_idx]
+    max_abs_case, max_abs_x, max_abs_basis, max_abs_actual, max_abs_expected = diagnostics[max_abs_idx]
+    max_rel_case, max_rel_x, max_rel_basis, max_rel_actual, max_rel_expected = diagnostics[max_rel_idx]
     print(
         f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
-        f"at case {max_abs_case} (x={max_abs_x}, basis_index={max_abs_basis})"
+        f"at case {max_abs_case} (x={max_abs_x}, basis_index={max_abs_basis}, "
+        f"actual={max_abs_actual}, expected={max_abs_expected})"
     )
     print(
         f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
-        f"at case {max_rel_case} (x={max_rel_x}, basis_index={max_rel_basis})"
+        f"at case {max_rel_case} (x={max_rel_x}, basis_index={max_rel_basis}, "
+        f"actual={max_rel_actual}, expected={max_rel_expected})"
     )
     assert np.allclose(actual_flat, expected_flat, atol=1e-10, rtol=0)
+
+
+def test_jax_EvaluateBsplines_jit_smoke():
+    x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0])
+    basis = TPI_jax.BsplineBasis1D(x1)
+    x = 4.7
+
+    non_jit = np.asarray(basis.EvaluateBsplines(x))
+    jit_eval = np.asarray(jax.jit(basis.EvaluateBsplines)(x))
+    assert np.allclose(jit_eval, non_jit, atol=1e-10, rtol=0)
 
 
 def test_SplineMatrix():

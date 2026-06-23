@@ -9,6 +9,7 @@ precision, so x64 is enabled before any JAX arrays are constructed.
 import numpy as np
 
 import jax
+from jax import core as jax_core
 
 jax.config.update("jax_enable_x64", True)
 
@@ -51,37 +52,44 @@ def _evaluate_cubic_bspline_basis_jax(knots, x):
     """Evaluate the full cubic B-spline basis on a clamped knot vector."""
     knots = jnp.asarray(knots, dtype=jnp.float64)
     x = jnp.asarray(x, dtype=jnp.float64)
+    nbasis = knots.shape[0] - 4
+    idx = jnp.arange(knots.shape[0] - 1)
+    endpoint = x == knots[-1]
 
     # Degree-0 basis functions live on the knot spans.
-    basis = jnp.where((knots[:-1] <= x) & (x < knots[1:]), 1.0, 0.0)
-    basis = basis.at[-1].set(jnp.where(x == knots[-1], 1.0, basis[-1]))
+    # The final span is closed on the right so x == knots[-1] maps to the last basis.
+    span_mask = (knots[:-1] <= x) & (
+        (x < knots[1:]) | ((idx == idx[-1]) & (x <= knots[1:]))
+    )
+    basis = jnp.where(span_mask, 1.0, 0.0)
 
-    # Recursively elevate from degree 0 to degree 3.
-    for degree in range(1, 4):
-        next_basis = []
-        for i in range(basis.shape[0] - 1):
-            left_denom = knots[i + degree] - knots[i]
-            right_denom = knots[i + degree + 1] - knots[i + 1]
+    def body_fun(degree, basis_vec):
+        left_knots = jnp.take(knots, idx, mode="clip")
+        left_knots_d = jnp.take(knots, idx + degree, mode="clip")
+        right_knots = jnp.take(knots, idx + 1, mode="clip")
+        right_knots_d = jnp.take(knots, idx + degree + 1, mode="clip")
 
-            left_safe = jnp.where(left_denom == 0.0, 1.0, left_denom)
-            right_safe = jnp.where(right_denom == 0.0, 1.0, right_denom)
+        left_denom = left_knots_d - left_knots
+        right_denom = right_knots_d - right_knots
+        active = idx < (basis_vec.shape[0] - degree)
 
-            left = jnp.where(
-                left_denom != 0.0,
-                (x - knots[i]) / left_safe * basis[i],
-                0.0,
-            )
-            right = jnp.where(
-                right_denom != 0.0,
-                (knots[i + degree + 1] - x) / right_safe * basis[i + 1],
-                0.0,
-            )
-            next_basis.append(left + right)
+        left = jnp.where(
+            left_denom != 0.0,
+            (x - left_knots) / left_denom * basis_vec,
+            0.0,
+        )
+        right = jnp.where(
+            right_denom != 0.0,
+            (right_knots_d - x) / right_denom * jnp.take(basis_vec, idx + 1, mode="clip"),
+            0.0,
+        )
+        next_basis = jnp.where(active, left + right, 0.0)
+        endpoint_basis = jnp.where(idx == (basis_vec.shape[0] - degree - 1), 1.0, 0.0)
+        next_basis = jnp.where(endpoint, endpoint_basis, next_basis)
+        return next_basis
 
-        basis = jnp.stack(next_basis)
-
-    basis = jnp.where(x == knots[-1], basis.at[-1].set(1.0), basis)
-    return basis
+    basis = jax.lax.fori_loop(1, 4, body_fun, basis)
+    return basis[:nbasis]
 
 
 class BsplineBasis1D:
@@ -93,6 +101,9 @@ class BsplineBasis1D:
         self.nbasis = int(self.knots.shape[0] - 4)
 
     def EvaluateBsplines(self, x):
+        if isinstance(x, jax_core.Tracer):
+            return _evaluate_cubic_bspline_basis_jax(self.knots, x)
+
         x_arr = np.asarray(x, dtype=np.float64)
         if x_arr.ndim != 0:
             raise ValueError("Evaluation point x must be scalar.")
