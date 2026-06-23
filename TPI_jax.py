@@ -53,43 +53,54 @@ def _evaluate_cubic_bspline_basis_jax(knots, x):
     knots = jnp.asarray(knots, dtype=jnp.float64)
     x = jnp.asarray(x, dtype=jnp.float64)
     nbasis = knots.shape[0] - 4
-    idx = jnp.arange(knots.shape[0] - 1)
-    endpoint = x == knots[-1]
+    span_count = knots.shape[0] - 7
+    span_idx = jnp.arange(span_count, dtype=jnp.int64)
 
-    # Degree-0 basis functions live on the knot spans.
-    # The final span is closed on the right so x == knots[-1] maps to the last basis.
-    span_mask = (knots[:-1] <= x) & (
-        (x < knots[1:]) | ((idx == idx[-1]) & (x <= knots[1:]))
+    # Degree-0 basis is defined over the positive-width knot spans.
+    # The final span is closed on the right to encode the clamped B-spline boundary convention.
+    span_left = knots[3:-4]
+    span_right = knots[4:-3]
+    span_mask = (span_left <= x) & (
+        (x < span_right) | ((span_idx == span_idx[-1]) & (x <= span_right))
     )
-    basis = jnp.where(span_mask, 1.0, 0.0)
+    span = jnp.sum(span_idx * span_mask.astype(span_idx.dtype)) + 3
 
-    def body_fun(degree, basis_vec):
-        left_knots = jnp.take(knots, idx, mode="clip")
-        left_knots_d = jnp.take(knots, idx + degree, mode="clip")
-        right_knots = jnp.take(knots, idx + 1, mode="clip")
-        right_knots_d = jnp.take(knots, idx + degree + 1, mode="clip")
-
-        left_denom = left_knots_d - left_knots
-        right_denom = right_knots_d - right_knots
-        active = idx < (basis_vec.shape[0] - degree)
-
-        left = jnp.where(
-            left_denom != 0.0,
-            (x - left_knots) / left_denom * basis_vec,
-            0.0,
+    lefts = jnp.stack(
+        (
+            x - knots[span],
+            x - knots[span - 1],
+            x - knots[span - 2],
         )
-        right = jnp.where(
-            right_denom != 0.0,
-            (right_knots_d - x) / right_denom * jnp.take(basis_vec, idx + 1, mode="clip"),
-            0.0,
+    )
+    rights = jnp.stack(
+        (
+            knots[span + 1] - x,
+            knots[span + 2] - x,
+            knots[span + 3] - x,
         )
-        next_basis = jnp.where(active, left + right, 0.0)
-        endpoint_basis = jnp.where(idx == (basis_vec.shape[0] - degree - 1), 1.0, 0.0)
-        next_basis = jnp.where(endpoint, endpoint_basis, next_basis)
-        return next_basis
+    )
 
-    basis = jax.lax.fori_loop(1, 4, body_fun, basis)
-    return basis[:nbasis]
+    basis = jnp.array((1.0, 0.0, 0.0, 0.0), dtype=jnp.float64)
+
+    def degree_body(j, carry):
+        basis_vec = carry
+
+        def inner_body(r, inner_carry):
+            basis_inner, saved = inner_carry
+            denom = rights[r] + lefts[j - r]
+            temp = jnp.where(denom != 0.0, basis_inner[r] / denom, 0.0)
+            basis_inner = basis_inner.at[r].set(saved + rights[r] * temp)
+            saved = lefts[j - r] * temp
+            return basis_inner, saved
+
+        basis_vec, saved = jax.lax.fori_loop(0, j + 1, inner_body, (basis_vec, 0.0))
+        basis_vec = basis_vec.at[j + 1].set(saved)
+        return basis_vec
+
+    basis = jax.lax.fori_loop(0, 3, degree_body, basis)
+    result = jnp.zeros(nbasis, dtype=jnp.float64)
+    result = jax.lax.dynamic_update_slice(result, basis, (span - 3,))
+    return result
 
 
 class BsplineBasis1D:
