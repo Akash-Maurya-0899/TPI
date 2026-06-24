@@ -991,6 +991,33 @@ def test_jax_TPInterpolationND_grad_smoke_including_interior_knot_points():
         assert np.all(np.isfinite(grad))
 
 
+def test_jax_tensor_product_contraction_matches_einsum():
+    rng = np.random.default_rng(42)
+    diagnostics = []
+
+    for dim in range(1, 5):
+        bases = tuple(rng.normal(size=4).astype(np.float64) for _ in range(dim))
+        coeff_block = rng.normal(size=(4,) * dim).astype(np.float64)
+        labels = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        basis_labels = ",".join(labels[i] for i in range(dim))
+        coeff_labels = "".join(labels[i] for i in range(dim))
+        expected = np.asarray(np.einsum(f"{basis_labels},{coeff_labels}->", *bases, coeff_block))
+        actual = np.asarray(TPI_jax._contract_tensor_product_jax(tuple(jax.numpy.asarray(b) for b in bases), jax.numpy.asarray(coeff_block)))
+        diagnostics.append((dim, actual, expected))
+
+    actual_flat = np.array([entry[1] for entry in diagnostics], dtype=np.float64)
+    expected_flat = np.array([entry[2] for entry in diagnostics], dtype=np.float64)
+    diff = actual_flat - expected_flat
+    abs_diff = np.abs(diff)
+    rel_den = np.maximum(np.abs(expected_flat), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    print(f"max abs diff: {abs_diff[max_abs_idx]:.3e} at dim={diagnostics[max_abs_idx][0]}")
+    print(f"max rel diff: {rel_diff[max_rel_idx]:.3e} at dim={diagnostics[max_rel_idx][0]}")
+    assert np.allclose(actual_flat, expected_flat, atol=1e-10, rtol=0)
+
+
 def test_jax_TPInterpolationND_matches_gsl():
     np.set_printoptions(precision=18)
     xi1 = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])

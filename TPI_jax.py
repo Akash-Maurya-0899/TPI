@@ -93,7 +93,12 @@ def _find_active_cubic_bspline_span_jax(knots, x):
 
 
 def _find_active_cubic_bspline_span_jax_jit(knots, x):
-    """Gradient-friendly cubic basis evaluation for the setup-built single-point JIT."""
+    """Gradient-friendly helper for the setup-built single-point JIT.
+
+    The span search is intentionally the same as _find_active_cubic_bspline_span_jax;
+    only the de Boor recurrence is written with static Python loops so jax.grad can
+    trace it. If the recurrence changes in one helper, the other must be checked too.
+    """
     knots = jnp.asarray(knots, dtype=jnp.float64)
     x = jnp.asarray(x, dtype=jnp.float64)
     span = jnp.searchsorted(knots[3:-3], x, side="right") + 2
@@ -342,7 +347,11 @@ def compute_spline_coefficients_nd(nodes, F):
     return _compute_spline_coefficients_nd(nodes, F)
 
 
-_EINSUM_LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+def _contract_tensor_product_jax(bases, coeff_block):
+    result = coeff_block
+    for basis in reversed(bases):
+        result = jnp.tensordot(result, basis, axes=((-1,), (0,)))
+    return result
 
 
 class TP_Interpolant_ND:
@@ -388,10 +397,7 @@ class TP_Interpolant_ND:
                 starts.append(start)
 
             coeff_block = jax.lax.dynamic_slice(c, tuple(starts), (4,) * n)
-            basis_labels = ",".join(_EINSUM_LABELS[i] for i in range(n))
-            coeff_labels = "".join(_EINSUM_LABELS[i] for i in range(n))
-            equation = f"{basis_labels},{coeff_labels}->"
-            return jnp.einsum(equation, *bases, coeff_block)
+            return _contract_tensor_product_jax(bases, coeff_block)
 
         return jax.jit(_evaluate)
 
@@ -446,10 +452,7 @@ class TP_Interpolant_ND:
             starts.append(start)
 
         coeff_block = jax.lax.dynamic_slice(self.c, tuple(starts), (4,) * self.n)
-        basis_labels = ",".join(_EINSUM_LABELS[i] for i in range(self.n))
-        coeff_labels = "".join(_EINSUM_LABELS[i] for i in range(self.n))
-        equation = f"{basis_labels},{coeff_labels}->"
-        return jnp.einsum(equation, *bases, coeff_block)
+        return _contract_tensor_product_jax(bases, coeff_block)
 
     def TPInterpolationND_batched(self, X):
         if self.c is None:
