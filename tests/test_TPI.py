@@ -803,6 +803,53 @@ def test_jax_ComputeSplineCoefficientsND_uses_cached_lu_factors(monkeypatch):
     assert np.allclose(actual, expected, atol=1e-10, rtol=0)
 
 
+def test_jax_ComputeSplineCoefficientsND_boundary_shell_matches_gsl():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    nodes = [xi, yi, zi]
+
+    f = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
+    xx, yy, zz = np.meshgrid(xi, yi, zi, indexing="ij")
+    F = f(xx, yy, zz)
+
+    TPint = TPI_jax.TP_Interpolant_ND(nodes)
+    TPint.TPInterpolationSetupND()
+    TPint.ComputeSplineCoefficientsND(F)
+    actual = np.asarray(TPint.GetSplineCoefficientsND())
+
+    expected = np.loadtxt(os.path.join(os.path.dirname(__file__), "../data/c_Mma_3D.dat"))
+    expected = expected.reshape(actual.shape)
+
+    indices = np.indices(actual.shape)
+    boundary_mask = np.zeros(actual.shape, dtype=bool)
+    for axis, axis_size in enumerate(actual.shape):
+        boundary_mask |= indices[axis] == 0
+        boundary_mask |= indices[axis] == axis_size - 1
+
+    actual_boundary = actual[boundary_mask]
+    expected_boundary = expected[boundary_mask]
+    boundary_indices = np.argwhere(boundary_mask)
+
+    diff = actual_boundary - expected_boundary
+    abs_diff = np.abs(diff)
+    rel_den = np.maximum(np.abs(expected_boundary), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    max_abs_index = tuple(boundary_indices[max_abs_idx])
+    max_rel_index = tuple(boundary_indices[max_rel_idx])
+    print(
+        f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
+        f"at index={max_abs_index} (actual={actual[max_abs_index]}, expected={expected[max_abs_index]})"
+    )
+    print(
+        f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
+        f"at index={max_rel_index} (actual={actual[max_rel_index]}, expected={expected[max_rel_index]})"
+    )
+    assert np.allclose(actual_boundary, expected_boundary, atol=1e-10, rtol=0)
+
+
 def test_jax_ComputeSplineCoefficientsND_jit_smoke():
     xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
     yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
