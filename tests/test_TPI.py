@@ -429,6 +429,125 @@ def test_jax_EvaluateBsplines3rdDerivatives_jit_smoke():
     assert np.allclose(jit_eval, non_jit, atol=1e-10, rtol=0)
 
 
+def test_jax_AssembleSplineMatrix_boundary_rows_matches_gsl():
+    x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0])
+    basis = TPI_jax.BsplineBasis1D(x1)
+    expected_first_row = np.array([
+        -0.647878198898607,
+        1.3639541029444362,
+        -1.0920157536698893,
+        0.5053617650684089,
+        -0.1294219154443486,
+        0.0,
+        0.0,
+        0.0,
+    ])
+    expected_last_row = np.array([
+        0.0,
+        0.0,
+        0.0,
+        -0.11152001784320277,
+        0.36347265074821655,
+        -0.6438789507572575,
+        0.6967578984039893,
+        -0.30483158055174536,
+    ])
+
+    phi, _ = basis.AssembleSplineMatrix()
+    phi = np.asarray(phi)
+    assert phi.shape == (8, 8)
+
+    diagnostics = []
+    for basis_index in range(phi.shape[1]):
+        diagnostics.append((0, basis_index, phi[0, basis_index], expected_first_row[basis_index]))
+    for basis_index in range(phi.shape[1]):
+        diagnostics.append((phi.shape[0] - 1, basis_index, phi[-1, basis_index], expected_last_row[basis_index]))
+
+    actual_flat = np.array([entry[2] for entry in diagnostics])
+    expected_flat = np.array([entry[3] for entry in diagnostics])
+    diff = actual_flat - expected_flat
+    abs_diff = np.abs(diff)
+    rel_den = np.maximum(np.abs(expected_flat), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    max_abs_row, max_abs_basis, max_abs_actual, max_abs_expected = diagnostics[max_abs_idx]
+    max_rel_row, max_rel_basis, max_rel_actual, max_rel_expected = diagnostics[max_rel_idx]
+    print(
+        f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
+        f"at row {max_abs_row} (basis_index={max_abs_basis}, "
+        f"actual={max_abs_actual}, expected={max_abs_expected})"
+    )
+    print(
+        f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
+        f"at row {max_rel_row} (basis_index={max_rel_basis}, "
+        f"actual={max_rel_actual}, expected={max_rel_expected})"
+    )
+    assert np.allclose(actual_flat, expected_flat, atol=1e-10, rtol=0)
+
+
+def test_jax_AssembleSplineMatrix_matches_gsl():
+    x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0])
+    basis = TPI_jax.BsplineBasis1D(x1)
+    expected_knots = np.array([1.1, 1.1, 1.1, 1.1, 3.2, 5.1, 7.2, 9.3, 12.0, 12.0, 12.0, 12.0])
+    expected_phi = np.array([
+        [-0.647878198898607, 1.3639541029444362, -1.0920157536698893, 0.5053617650684089, -0.1294219154443486, 0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.22562499999999996, 0.5936372950819674, 0.18073770491803284, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.1807377049180329, 0.6713114754098362, 0.14795081967213106, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.17213114754098363, 0.675694939415538, 0.1521739130434783, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.22010869565217378, 0.588485054347826, 0.1914062500000001, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, -0.11152001784320277, 0.36347265074821655, -0.6438789507572575, 0.6967578984039893, -0.30483158055174536],
+    ])
+
+    phi, knots = basis.AssembleSplineMatrix()
+    phi = np.asarray(phi)
+    knots = np.asarray(knots)
+    assert phi.shape == expected_phi.shape
+    assert knots.shape == expected_knots.shape
+
+    diagnostics = []
+    for row_index in range(phi.shape[0]):
+        for basis_index in range(phi.shape[1]):
+            diagnostics.append((row_index, basis_index, phi[row_index, basis_index], expected_phi[row_index, basis_index]))
+
+    actual_flat = np.array([entry[2] for entry in diagnostics])
+    expected_flat = np.array([entry[3] for entry in diagnostics])
+    diff = actual_flat - expected_flat
+    abs_diff = np.abs(diff)
+    rel_den = np.maximum(np.abs(expected_flat), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    max_abs_row, max_abs_basis, max_abs_actual, max_abs_expected = diagnostics[max_abs_idx]
+    max_rel_row, max_rel_basis, max_rel_actual, max_rel_expected = diagnostics[max_rel_idx]
+    print(
+        f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
+        f"at row {max_abs_row} (basis_index={max_abs_basis}, "
+        f"actual={max_abs_actual}, expected={max_abs_expected})"
+    )
+    print(
+        f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
+        f"at row {max_rel_row} (basis_index={max_rel_basis}, "
+        f"actual={max_rel_actual}, expected={max_rel_expected})"
+    )
+    assert np.allclose(actual_flat, expected_flat, atol=1e-10, rtol=0)
+    assert np.array_equal(knots, expected_knots)
+
+
+def test_jax_AssembleSplineMatrix_jit_smoke():
+    x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0])
+    basis = TPI_jax.BsplineBasis1D(x1)
+
+    non_jit_phi, non_jit_knots = basis.AssembleSplineMatrix()
+    jit_fn = jax.jit(basis.AssembleSplineMatrix)
+    jit_phi, jit_knots = jit_fn()
+
+    assert np.allclose(np.asarray(jit_phi), np.asarray(non_jit_phi), atol=1e-10, rtol=0)
+    assert np.array_equal(np.asarray(jit_knots), np.asarray(non_jit_knots))
+
+
 def test_SplineMatrix():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12])
     b = TPI.BsplineBasis1D(x1)

@@ -228,6 +228,30 @@ class BsplineBasis1D:
 
         return _evaluate_cubic_bspline_3rd_derivatives_jax(self.knots, x_val)
 
+    def AssembleSplineMatrix(self):
+        """Assemble the cubic spline matrix with not-a-knot boundary conditions."""
+        xi = self.xi
+        knots = self.knots
+
+        phi_internal = jax.vmap(lambda x: _evaluate_cubic_bspline_basis_jax(knots, x))(xi)
+
+        xi12mean = 0.5 * (xi[0] + xi[1])
+        xi23mean = 0.5 * (xi[1] + xi[2])
+        xim32mean = 0.5 * (xi[-3] + xi[-2])
+        xim21mean = 0.5 * (xi[-2] + xi[-1])
+
+        first_row = (
+            _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xi12mean)
+            - _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xi23mean)
+        )
+        last_row = (
+            _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xim32mean)
+            - _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xim21mean)
+        )
+
+        phi = jnp.vstack((first_row, phi_internal, last_row))
+        return phi, knots
+
 
 def construct_knots(nodes):
     """Construct the cubic B-spline knot vector matching GSL's convention."""
