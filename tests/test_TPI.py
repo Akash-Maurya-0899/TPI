@@ -34,6 +34,8 @@ import pytest
 import numpy as np
 import os
 import sys
+import inspect
+import time
 import jax
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -873,6 +875,120 @@ def test_jax_ComputeSplineCoefficientsND_jit_smoke():
     jit_coeffs = np.asarray(jit_fn(nodes, F))
 
     assert np.allclose(jit_coeffs, non_jit, atol=1e-10, rtol=0)
+
+
+def test_jax_TPInterpolationSetupND_builds_explicit_jit_evaluator_and_tracks_updated_coefficients():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    nodes = [xi, yi, zi]
+
+    f1 = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
+    f2 = lambda x, y, z: np.cos(3.0 * x) * np.sqrt(y + 1.05) * (1.0 + z**2)
+    xx, yy, zz = np.meshgrid(xi, yi, zi, indexing="ij")
+    F1 = f1(xx, yy, zz)
+    F2 = f2(xx, yy, zz)
+    point = np.array([0.1692602, 0.2827312351474, -0.26624193])
+
+    TPint = TPI_jax.TP_Interpolant_ND(nodes)
+    TPint.TPInterpolationSetupND()
+
+    assert hasattr(TPint, "_jit_eval")
+    signature = inspect.signature(TPint._jit_eval)
+    assert list(signature.parameters)[:2] == ["c", "X"]
+
+    TPint.ComputeSplineCoefficientsND(F1)
+    non_jit_1 = np.asarray(TPint.TPInterpolationND(point))
+    explicit_1 = np.asarray(TPint._jit_eval(TPint.c, jax.numpy.asarray(point, dtype=jax.numpy.float64)))
+
+    TPint.ComputeSplineCoefficientsND(F2)
+    non_jit_2 = np.asarray(TPint.TPInterpolationND(point))
+    explicit_2 = np.asarray(TPint._jit_eval(TPint.c, jax.numpy.asarray(point, dtype=jax.numpy.float64)))
+
+    ref1 = TPI_jax.TP_Interpolant_ND(nodes)
+    ref1.ComputeSplineCoefficientsND(F1)
+    expected_1 = np.asarray(ref1.TPInterpolationND(point))
+
+    ref2 = TPI_jax.TP_Interpolant_ND(nodes)
+    ref2.ComputeSplineCoefficientsND(F2)
+    expected_2 = np.asarray(ref2.TPInterpolationND(point))
+
+    assert np.allclose(non_jit_1, expected_1, atol=1e-10, rtol=0)
+    assert np.allclose(explicit_1, expected_1, atol=1e-10, rtol=0)
+    assert np.allclose(non_jit_2, expected_2, atol=1e-10, rtol=0)
+    assert np.allclose(explicit_2, expected_2, atol=1e-10, rtol=0)
+    assert not np.allclose(expected_1, expected_2, atol=1e-12, rtol=0)
+
+
+def test_jax_TPInterpolationND_jit_cache_reuses_compiled_kernel_for_same_instance_and_new_points():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    nodes = [xi, yi, zi]
+
+    f = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
+    xx, yy, zz = np.meshgrid(xi, yi, zi, indexing="ij")
+    F = f(xx, yy, zz)
+
+    TPint = TPI_jax.TP_Interpolant_ND(nodes)
+    TPint.ComputeSplineCoefficientsND(F)
+
+    x_same = np.array([0.1692602, 0.2827312351474, -0.26624193])
+    x_new = np.array([0.123, -0.2, 0.4])
+    call_points = [x_same, x_same, x_same, x_new, x_same, x_same, x_same, x_same, x_same, x_same]
+
+    times = []
+    outputs = []
+    for point in call_points:
+        start = time.perf_counter()
+        outputs.append(np.asarray(TPint.TPInterpolationND(point)))
+        times.append((time.perf_counter() - start) * 1e3)
+
+    steady_times = np.array(times[1:], dtype=np.float64)
+    first_time = float(times[0])
+    median_steady = float(np.median(steady_times))
+    max_new_point_time = float(times[3])
+    print(f"same interpolant means one TP_Interpolant_ND instance, one fixed X repeated, and one different X among calls 2-10")
+    print(f"call times (ms): {np.array2string(np.asarray(times), precision=3, separator=', ')}")
+    print(f"first call (ms): {first_time:.3f}")
+    print(f"steady median (ms): {median_steady:.3f}")
+    print(f"different-X call (ms): {max_new_point_time:.3f}")
+
+    assert first_time > 10.0 * median_steady
+    assert max_new_point_time < 2.5 * first_time
+    assert np.allclose(outputs[0], outputs[1], atol=1e-10, rtol=0)
+    assert np.allclose(outputs[1], outputs[2], atol=1e-10, rtol=0)
+    assert np.allclose(outputs[0], outputs[4], atol=1e-10, rtol=0)
+    assert not np.allclose(outputs[0], outputs[3], atol=1e-12, rtol=0)
+
+
+def test_jax_TPInterpolationND_grad_smoke_including_interior_knot_points():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    nodes = [xi, yi, zi]
+
+    f = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
+    xx, yy, zz = np.meshgrid(xi, yi, zi, indexing="ij")
+    F = f(xx, yy, zz)
+
+    TPint = TPI_jax.TP_Interpolant_ND(nodes)
+    TPint.ComputeSplineCoefficientsND(F)
+
+    grad_fn = jax.grad(lambda x: TPint.TPInterpolationND(x))
+    points = [
+        np.array([xi[3], yi[5], zi[4]], dtype=np.float64),
+        np.array([0.1692602, 0.2827312351474, -0.26624193], dtype=np.float64),
+        np.array([0.123, -0.2, 0.4], dtype=np.float64),
+    ]
+
+    diagnostics = []
+    for point_index, point in enumerate(points):
+        grad = np.asarray(grad_fn(jax.numpy.asarray(point, dtype=jax.numpy.float64)))
+        diagnostics.append((point_index, point, grad))
+        print(f"gradient at point_index={point_index}, point={point}: {grad}")
+        assert grad.shape == point.shape
+        assert np.all(np.isfinite(grad))
 
 
 def test_jax_TPInterpolationND_matches_gsl():

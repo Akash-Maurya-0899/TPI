@@ -92,6 +92,40 @@ def _find_active_cubic_bspline_span_jax(knots, x):
     return basis, span - 3
 
 
+def _find_active_cubic_bspline_span_jax_jit(knots, x):
+    """Gradient-friendly cubic basis evaluation for the setup-built single-point JIT."""
+    knots = jnp.asarray(knots, dtype=jnp.float64)
+    x = jnp.asarray(x, dtype=jnp.float64)
+    span = jnp.searchsorted(knots[3:-3], x, side="right") + 2
+    span = jnp.clip(span, 3, knots.shape[0] - 5)
+
+    lefts = jnp.stack(
+        (
+            x - knots[span],
+            x - knots[span - 1],
+            x - knots[span - 2],
+        )
+    )
+    rights = jnp.stack(
+        (
+            knots[span + 1] - x,
+            knots[span + 2] - x,
+            knots[span + 3] - x,
+        )
+    )
+
+    basis = jnp.array((1.0, 0.0, 0.0, 0.0), dtype=jnp.float64)
+    for j in range(3):
+        saved = 0.0
+        for r in range(j + 1):
+            denom = rights[r] + lefts[j - r]
+            temp = jnp.where(denom != 0.0, basis[r] / denom, 0.0)
+            basis = basis.at[r].set(saved + rights[r] * temp)
+            saved = lefts[j - r] * temp
+        basis = basis.at[j + 1].set(saved)
+    return basis, span - 3
+
+
 def _evaluate_cubic_bspline_basis_jax(knots, x):
     """Evaluate the full cubic B-spline basis on a clamped knot vector."""
     basis, start = _find_active_cubic_bspline_span_jax(knots, x)
@@ -339,6 +373,27 @@ class TP_Interpolant_ND:
         self.bases = tuple(BsplineBasis1D(np.asarray(node)) for node in self.nodes)
         self.knots_list = tuple(base.knots for base in self.bases)
         self.spline_matrix_factors = tuple(_factor_spline_matrix_jax(node) for node in self.nodes)
+        self._jit_eval = self._build_evaluator()
+
+    def _build_evaluator(self):
+        knots_list = self.knots_list
+        n = self.n
+
+        def _evaluate(c, X):
+            bases = []
+            starts = []
+            for axis in range(n):
+                basis, start = _find_active_cubic_bspline_span_jax_jit(knots_list[axis], X[axis])
+                bases.append(basis)
+                starts.append(start)
+
+            coeff_block = jax.lax.dynamic_slice(c, tuple(starts), (4,) * n)
+            basis_labels = ",".join(_EINSUM_LABELS[i] for i in range(n))
+            coeff_labels = "".join(_EINSUM_LABELS[i] for i in range(n))
+            equation = f"{basis_labels},{coeff_labels}->"
+            return jnp.einsum(equation, *bases, coeff_block)
+
+        return jax.jit(_evaluate)
 
     def ComputeSplineCoefficientsND(self, F):
         coeffs = _compute_spline_coefficients_nd(self.nodes, F, self.spline_matrix_factors)
@@ -361,7 +416,7 @@ class TP_Interpolant_ND:
 
         if isinstance(X, jax_core.Tracer):
             X_arr = jnp.asarray(X, dtype=jnp.float64)
-            return self._TPInterpolationND_jax(X_arr)
+            return self._jit_eval(self.c, X_arr)
 
         X_arr = np.asarray(X, dtype=np.float64)
         if X_arr.ndim != 1:
@@ -380,7 +435,7 @@ class TP_Interpolant_ND:
                     f"knots vector [{x_min}, {x_max}]!"
                 )
 
-        return self._TPInterpolationND_jax(jnp.asarray(X_arr, dtype=jnp.float64))
+        return self._jit_eval(self.c, jnp.asarray(X_arr, dtype=jnp.float64))
 
     def _TPInterpolationND_jax(self, X):
         bases = []
