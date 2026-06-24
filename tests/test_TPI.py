@@ -410,10 +410,11 @@ def test_jax_EvaluateBsplines3rdDerivatives_jit_across_spans():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0])
     basis = TPI_jax.BsplineBasis1D(x1)
     points = [1.5, 3.5, 5.05, 5.15, 6.3, 8.0, 10.5]
+    jit_eval_fn = jax.jit(basis.EvaluateBsplines3rdDerivatives)
 
     for x in points:
         non_jit = np.asarray(basis.EvaluateBsplines3rdDerivatives(x))
-        jit_eval = np.asarray(jax.jit(basis.EvaluateBsplines3rdDerivatives)(x))
+        jit_eval = np.asarray(jit_eval_fn(x))
         assert np.allclose(jit_eval, non_jit, atol=1e-10, rtol=0)
 
 
@@ -421,9 +422,10 @@ def test_jax_EvaluateBsplines3rdDerivatives_jit_smoke():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0])
     basis = TPI_jax.BsplineBasis1D(x1)
     x = 4.7
+    jit_eval_fn = jax.jit(basis.EvaluateBsplines3rdDerivatives)
 
     non_jit = np.asarray(basis.EvaluateBsplines3rdDerivatives(x))
-    jit_eval = np.asarray(jax.jit(basis.EvaluateBsplines3rdDerivatives)(x))
+    jit_eval = np.asarray(jit_eval_fn(x))
     assert np.allclose(jit_eval, non_jit, atol=1e-10, rtol=0)
 
 
