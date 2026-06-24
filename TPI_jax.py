@@ -52,16 +52,8 @@ def _find_active_cubic_bspline_span_jax(knots, x):
     """Return the 4 active cubic basis values and the first active index."""
     knots = jnp.asarray(knots, dtype=jnp.float64)
     x = jnp.asarray(x, dtype=jnp.float64)
-    span_count = knots.shape[0] - 7
-    span_idx = jnp.arange(span_count, dtype=jnp.int64)
-
-    # The final interval is closed on the right so the right boundary is included.
-    span_left = knots[3:-4]
-    span_right = knots[4:-3]
-    span_mask = (span_left <= x) & (
-        (x < span_right) | ((span_idx == span_idx[-1]) & (x <= span_right))
-    )
-    span = jnp.sum(span_idx * span_mask.astype(span_idx.dtype)) + 3
+    span = jnp.searchsorted(knots[3:-3], x, side="right") + 2
+    span = jnp.clip(span, 3, knots.shape[0] - 5)
 
     lefts = jnp.stack(
         (

@@ -41,6 +41,59 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import TPI
 import TPI_jax
 
+
+def _reference_find_active_cubic_bspline_span_batched(knots, xs):
+    knots = np.asarray(knots, dtype=np.float64)
+    xs = np.asarray(xs, dtype=np.float64)
+
+    span = np.searchsorted(knots[3:-3], xs, side="right") + 2
+    span = np.clip(span, 3, knots.shape[0] - 5)
+
+    lefts = np.stack(
+        (
+            xs - knots[span],
+            xs - knots[span - 1],
+            xs - knots[span - 2],
+        ),
+        axis=-1,
+    )
+    rights = np.stack(
+        (
+            knots[span + 1] - xs,
+            knots[span + 2] - xs,
+            knots[span + 3] - xs,
+        ),
+        axis=-1,
+    )
+
+    basis = np.zeros((xs.shape[0], 4), dtype=np.float64)
+    basis[:, 0] = 1.0
+    for j in range(3):
+        saved = np.zeros(xs.shape[0], dtype=np.float64)
+        for r in range(j + 1):
+            denom = rights[:, r] + lefts[:, j - r]
+            temp = np.where(denom != 0.0, basis[:, r] / denom, 0.0)
+            basis[:, r] = saved + rights[:, r] * temp
+            saved = lefts[:, j - r] * temp
+        basis[:, j + 1] = saved
+
+    return basis, span - 3
+
+
+def _span_case_data():
+    x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0], dtype=np.float64)
+    x2 = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25], dtype=np.float64)
+    y2 = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0], dtype=np.float64)
+    z3 = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0], dtype=np.float64)
+    x4 = np.array([-0.8, -0.6, -0.4, 0.0, 0.5, 1.0, 1.5], dtype=np.float64)
+    return [
+        ("1D", TPI_jax.construct_knots(x1)),
+        ("2D-x", TPI_jax.construct_knots(x2)),
+        ("2D-y", TPI_jax.construct_knots(y2)),
+        ("3D-z", TPI_jax.construct_knots(z3)),
+        ("4D-x4", TPI_jax.construct_knots(x4)),
+    ]
+
 def test_BsplineBasis1D():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12])
     b = TPI.BsplineBasis1D(x1)
@@ -121,6 +174,119 @@ def test_jax_construct_knots_matches_gsl():
         knots = TPI_jax.construct_knots(nodes)
         assert np.array_equal(np.asarray(knots), expected_knots)
         assert np.asarray(knots).dtype == np.float64
+
+
+def test_jax_find_active_cubic_bspline_span_matches_searchsorted_dense_grid():
+    diagnostics = []
+    for case_label, knots in _span_case_data():
+        xs = np.linspace(float(knots[3]), float(knots[-4]), 30, dtype=np.float64)
+
+        jax_eval = jax.jit(jax.vmap(lambda x: TPI_jax._find_active_cubic_bspline_span_jax(knots, x)))
+        # warmup: trigger JIT compilation before assertions
+        warmup_basis, warmup_start = jax_eval(xs)
+
+        actual_basis, actual_start = jax_eval(xs)
+        expected_basis, expected_start = _reference_find_active_cubic_bspline_span_batched(knots, xs)
+
+        actual_basis = np.asarray(actual_basis)
+        actual_start = np.asarray(actual_start)
+        expected_basis = np.asarray(expected_basis)
+        expected_start = np.asarray(expected_start)
+
+        assert np.array_equal(np.asarray(warmup_basis), actual_basis)
+        assert np.array_equal(np.asarray(warmup_start), actual_start)
+        assert np.array_equal(actual_start, expected_start)
+        assert np.allclose(actual_basis, expected_basis, atol=1e-14, rtol=0)
+
+        x_repeated = np.repeat(xs, actual_basis.shape[1])
+        basis_indices = np.tile(np.arange(actual_basis.shape[1]), xs.shape[0])
+        diagnostics.extend(
+            [
+                (case_label, x_repeated[idx], basis_indices[idx], actual_basis.reshape(-1)[idx], expected_basis.reshape(-1)[idx])
+                for idx in range(actual_basis.size)
+            ]
+        )
+
+    actual_flat = np.array([entry[3] for entry in diagnostics], dtype=np.float64)
+    expected_flat = np.array([entry[4] for entry in diagnostics], dtype=np.float64)
+    diff = actual_flat - expected_flat
+    abs_diff = np.abs(diff)
+    rel_den = np.maximum(np.abs(expected_flat), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    max_abs_case, max_abs_x, max_abs_basis, max_abs_actual, max_abs_expected = diagnostics[max_abs_idx]
+    max_rel_case, max_rel_x, max_rel_basis, max_rel_actual, max_rel_expected = diagnostics[max_rel_idx]
+    print(
+        f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
+        f"at x={max_abs_x} (case={max_abs_case}, basis_index={max_abs_basis}, "
+        f"actual={max_abs_actual}, expected={max_abs_expected})"
+    )
+    print(
+        f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
+        f"at x={max_rel_x} (case={max_rel_case}, basis_index={max_rel_basis}, "
+        f"actual={max_rel_actual}, expected={max_rel_expected})"
+    )
+    assert np.allclose(actual_flat, expected_flat, atol=1e-14, rtol=0)
+
+
+def test_jax_find_active_cubic_bspline_span_boundary_points():
+    diagnostics = []
+    for case_label, knots in _span_case_data():
+        xs = np.asarray(knots[3:-3], dtype=np.float64)
+        if xs.size > 10:
+            sample_idx = np.unique(np.linspace(0, xs.size - 1, 10, dtype=int))
+            xs = xs[sample_idx]
+
+        jax_eval = jax.jit(jax.vmap(lambda x: TPI_jax._find_active_cubic_bspline_span_jax(knots, x)))
+        # warmup: trigger JIT compilation before assertions
+        warmup_basis, warmup_start = jax_eval(xs)
+
+        actual_basis, actual_start = jax_eval(xs)
+        expected_basis, expected_start = _reference_find_active_cubic_bspline_span_batched(knots, xs)
+
+        actual_basis = np.asarray(actual_basis)
+        actual_start = np.asarray(actual_start)
+        expected_basis = np.asarray(expected_basis)
+        expected_start = np.asarray(expected_start)
+
+        assert np.array_equal(np.asarray(warmup_basis), actual_basis)
+        assert np.array_equal(np.asarray(warmup_start), actual_start)
+        assert np.array_equal(actual_start, expected_start)
+        assert np.all((0 <= actual_start) & (actual_start <= len(knots) - 8))
+        assert np.allclose(actual_basis.sum(axis=1), 1.0, atol=1e-14, rtol=0)
+        assert np.allclose(actual_basis, expected_basis, atol=1e-14, rtol=0)
+
+        x_repeated = np.repeat(xs, actual_basis.shape[1])
+        basis_indices = np.tile(np.arange(actual_basis.shape[1]), xs.shape[0])
+        diagnostics.extend(
+            [
+                (case_label, x_repeated[idx], basis_indices[idx], actual_basis.reshape(-1)[idx], expected_basis.reshape(-1)[idx])
+                for idx in range(actual_basis.size)
+            ]
+        )
+
+    actual_flat = np.array([entry[3] for entry in diagnostics], dtype=np.float64)
+    expected_flat = np.array([entry[4] for entry in diagnostics], dtype=np.float64)
+    diff = actual_flat - expected_flat
+    abs_diff = np.abs(diff)
+    rel_den = np.maximum(np.abs(expected_flat), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    max_abs_case, max_abs_x, max_abs_basis, max_abs_actual, max_abs_expected = diagnostics[max_abs_idx]
+    max_rel_case, max_rel_x, max_rel_basis, max_rel_actual, max_rel_expected = diagnostics[max_rel_idx]
+    print(
+        f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
+        f"at x={max_abs_x} (case={max_abs_case}, basis_index={max_abs_basis}, "
+        f"actual={max_abs_actual}, expected={max_abs_expected})"
+    )
+    print(
+        f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
+        f"at x={max_rel_x} (case={max_rel_case}, basis_index={max_rel_basis}, "
+        f"actual={max_rel_actual}, expected={max_rel_expected})"
+    )
+    assert np.allclose(actual_flat, expected_flat, atol=1e-14, rtol=0)
 
 
 def test_jax_EvaluateBsplines_matches_gsl():
