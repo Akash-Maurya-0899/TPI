@@ -48,16 +48,14 @@ def _construct_knots_jax(nodes):
     return jnp.concatenate((start, nodes, end))
 
 
-def _evaluate_cubic_bspline_basis_jax(knots, x):
-    """Evaluate the full cubic B-spline basis on a clamped knot vector."""
+def _find_active_cubic_bspline_span_jax(knots, x):
+    """Return the 4 active cubic basis values and the first active index."""
     knots = jnp.asarray(knots, dtype=jnp.float64)
     x = jnp.asarray(x, dtype=jnp.float64)
-    nbasis = knots.shape[0] - 4
     span_count = knots.shape[0] - 7
     span_idx = jnp.arange(span_count, dtype=jnp.int64)
 
-    # Degree-0 basis is defined over the positive-width knot spans.
-    # The final span is closed on the right to encode the clamped B-spline boundary convention.
+    # The final interval is closed on the right so the right boundary is included.
     span_left = knots[3:-4]
     span_right = knots[4:-3]
     span_mask = (span_left <= x) & (
@@ -98,8 +96,15 @@ def _evaluate_cubic_bspline_basis_jax(knots, x):
         return basis_vec
 
     basis = jax.lax.fori_loop(0, 3, degree_body, basis)
+    return basis, span - 3
+
+
+def _evaluate_cubic_bspline_basis_jax(knots, x):
+    """Evaluate the full cubic B-spline basis on a clamped knot vector."""
+    basis, start = _find_active_cubic_bspline_span_jax(knots, x)
+    nbasis = jnp.asarray(knots).shape[0] - 4
     result = jnp.zeros(nbasis, dtype=jnp.float64)
-    result = jax.lax.dynamic_update_slice(result, basis, (span - 3,))
+    result = jax.lax.dynamic_update_slice(result, basis, (start,))
     return result
 
 
@@ -286,6 +291,9 @@ def compute_spline_coefficients_nd(nodes, F):
     return coeffs
 
 
+_EINSUM_LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
 class TP_Interpolant_ND:
     """JAX-side tensor-product spline interpolant helper."""
 
@@ -327,3 +335,54 @@ class TP_Interpolant_ND:
         if coeffs.shape != dims:
             raise ValueError(f"Spline coefficients should have shape {list(dims)}")
         self.c = coeffs
+
+    def TPInterpolationND(self, X):
+        if self.c is None:
+            raise ValueError("Spline coefficients have not been set.")
+
+        if isinstance(X, jax_core.Tracer):
+            X_arr = jnp.asarray(X, dtype=jnp.float64)
+            return self._TPInterpolationND_jax(X_arr)
+
+        X_arr = np.asarray(X, dtype=np.float64)
+        if X_arr.ndim != 1:
+            raise ValueError("Evaluation point X is more than one-dimensional!")
+        if X_arr.shape[0] != self.n:
+            raise ValueError(
+                f"Expected X to be array of length {self.n}, but got length {X_arr.shape[0]}"
+            )
+
+        for axis, node in enumerate(self.nodes):
+            x_min = float(np.asarray(node[0]))
+            x_max = float(np.asarray(node[-1]))
+            if X_arr[axis] < x_min or X_arr[axis] > x_max:
+                raise ValueError(
+                    f"TP_Interpolation_ND: X[{axis}] = {X_arr[axis]} is outside of "
+                    f"knots vector [{x_min}, {x_max}]!"
+                )
+
+        return self._TPInterpolationND_jax(jnp.asarray(X_arr, dtype=jnp.float64))
+
+    def _TPInterpolationND_jax(self, X):
+        bases = []
+        starts = []
+        for axis in range(self.n):
+            basis, start = _find_active_cubic_bspline_span_jax(self.knots_list[axis], X[axis])
+            bases.append(basis)
+            starts.append(start)
+
+        coeff_block = jax.lax.dynamic_slice(self.c, tuple(starts), (4,) * self.n)
+        basis_labels = ",".join(_EINSUM_LABELS[i] for i in range(self.n))
+        coeff_labels = "".join(_EINSUM_LABELS[i] for i in range(self.n))
+        equation = f"{basis_labels},{coeff_labels}->"
+        return jnp.einsum(equation, *bases, coeff_block)
+
+    def __call__(self, X):
+        X_arr = np.atleast_1d(np.asarray(X, dtype=np.float64))
+        if X_arr.ndim != 1:
+            raise ValueError("Evaluation point X is more than one-dimensional!")
+        if X_arr.shape[0] != self.n:
+            raise ValueError(
+                f"Expected X to be array of length {self.n}, but got length {X_arr.shape[0]}"
+            )
+        return self.TPInterpolationND(X_arr)
