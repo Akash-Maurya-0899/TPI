@@ -55,6 +55,7 @@ def _make_batch_points(nodes, count=64):
     return rng.uniform(lows, highs, size=(count, len(nodes))).astype(np.float64)
 
 
+# GSL/Cython has no native batch API here, so this is a Python loop over the scalar call.
 def _gsl_batch_eval(interp, batch_points):
     return np.asarray([interp.TPInterpolationND(point) for point in batch_points], dtype=np.float64)
 
@@ -115,6 +116,7 @@ def main():
         "dim | single GSL (ms) | single JAX warmup (ms) | single JAX steady (ms) "
         "| batch GSL (ms)  | batch JAX warmup (ms)  | batch JAX steady (ms)"
     )
+    print("note: GSL batch timings use a Python loop over the scalar API, not a native batched GSL call")
 
     for dim, nodes, fn, single_point in CASES:
         values = _make_values(nodes, fn)

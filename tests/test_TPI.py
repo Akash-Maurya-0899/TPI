@@ -803,7 +803,7 @@ def test_jax_ComputeSplineCoefficientsND_uses_cached_lu_factors(monkeypatch):
     assert np.allclose(actual, expected, atol=1e-10, rtol=0)
 
 
-def test_jax_ComputeSplineCoefficientsND_boundary_shell_matches_gsl():
+def test_jax_ComputeSplineCoefficientsND_boundary_rows_isolated_by_axis_matches_gsl():
     xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
     yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
     zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
@@ -821,33 +821,41 @@ def test_jax_ComputeSplineCoefficientsND_boundary_shell_matches_gsl():
     expected = np.loadtxt(os.path.join(os.path.dirname(__file__), "../data/c_Mma_3D.dat"))
     expected = expected.reshape(actual.shape)
 
-    indices = np.indices(actual.shape)
-    boundary_mask = np.zeros(actual.shape, dtype=bool)
-    for axis, axis_size in enumerate(actual.shape):
-        boundary_mask |= indices[axis] == 0
-        boundary_mask |= indices[axis] == axis_size - 1
+    rng = np.random.default_rng(42)
+    fixed_positions = {
+        0: np.array([[0, j, k] for j, k in zip(rng.integers(1, actual.shape[1] - 1, size=10), rng.integers(1, actual.shape[2] - 1, size=10))], dtype=int),
+        1: np.array([[i, 0, k] for i, k in zip(rng.integers(1, actual.shape[0] - 1, size=10), rng.integers(1, actual.shape[2] - 1, size=10))], dtype=int),
+        2: np.array([[i, j, 0] for i, j in zip(rng.integers(1, actual.shape[0] - 1, size=10), rng.integers(1, actual.shape[1] - 1, size=10))], dtype=int),
+    }
+    axis_names = {0: "axis=0", 1: "axis=1", 2: "axis=2"}
 
-    actual_boundary = actual[boundary_mask]
-    expected_boundary = expected[boundary_mask]
-    boundary_indices = np.argwhere(boundary_mask)
+    for axis in range(actual.ndim):
+        zero_indices = fixed_positions[axis].copy()
+        minus_indices = fixed_positions[axis].copy()
+        zero_indices[:, axis] = 0
+        minus_indices[:, axis] = actual.shape[axis] - 1
+        selected_indices = np.vstack((zero_indices, minus_indices))
 
-    diff = actual_boundary - expected_boundary
-    abs_diff = np.abs(diff)
-    rel_den = np.maximum(np.abs(expected_boundary), np.finfo(np.float64).tiny)
-    rel_diff = abs_diff / rel_den
-    max_abs_idx = int(np.argmax(abs_diff))
-    max_rel_idx = int(np.argmax(rel_diff))
-    max_abs_index = tuple(boundary_indices[max_abs_idx])
-    max_rel_index = tuple(boundary_indices[max_rel_idx])
-    print(
-        f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
-        f"at index={max_abs_index} (actual={actual[max_abs_index]}, expected={expected[max_abs_index]})"
-    )
-    print(
-        f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
-        f"at index={max_rel_index} (actual={actual[max_rel_index]}, expected={expected[max_rel_index]})"
-    )
-    assert np.allclose(actual_boundary, expected_boundary, atol=1e-10, rtol=0)
+        actual_selected = actual[tuple(selected_indices.T)]
+        expected_selected = expected[tuple(selected_indices.T)]
+
+        diff = actual_selected - expected_selected
+        abs_diff = np.abs(diff)
+        rel_den = np.maximum(np.abs(expected_selected), np.finfo(np.float64).tiny)
+        rel_diff = abs_diff / rel_den
+        max_abs_idx = int(np.argmax(abs_diff))
+        max_rel_idx = int(np.argmax(rel_diff))
+        max_abs_index = tuple(selected_indices[max_abs_idx])
+        max_rel_index = tuple(selected_indices[max_rel_idx])
+        print(
+            f"{axis_names[axis]} max abs diff: {abs_diff[max_abs_idx]:.3e} "
+            f"at index={max_abs_index} (actual={actual[max_abs_index]}, expected={expected[max_abs_index]})"
+        )
+        print(
+            f"{axis_names[axis]} max rel diff: {rel_diff[max_rel_idx]:.3e} "
+            f"at index={max_rel_index} (actual={actual[max_rel_index]}, expected={expected[max_rel_index]})"
+        )
+        assert np.allclose(actual_selected, expected_selected, atol=1e-10, rtol=0)
 
 
 def test_jax_ComputeSplineCoefficientsND_jit_smoke():
