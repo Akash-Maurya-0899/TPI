@@ -548,6 +548,66 @@ def test_jax_AssembleSplineMatrix_jit_smoke():
     assert np.array_equal(np.asarray(jit_knots), np.asarray(non_jit_knots))
 
 
+def test_jax_ComputeSplineCoefficientsND_matches_gsl():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    nodes = [xi, yi, zi]
+
+    f = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
+    xx, yy, zz = np.meshgrid(xi, yi, zi, indexing="ij")
+    F = f(xx, yy, zz)
+
+    TPint = TPI_jax.TP_Interpolant_ND(nodes)
+    TPint.TPInterpolationSetupND()
+    TPint.ComputeSplineCoefficientsND(F)
+
+    actual = np.asarray(TPint.GetSplineCoefficientsND())
+    expected = np.loadtxt(os.path.join(os.path.dirname(__file__), "../data/c_Mma_3D.dat"))
+    expected = expected.reshape(actual.shape)
+
+    diagnostics = []
+    for index in np.ndindex(actual.shape):
+        diagnostics.append((index, actual[index], expected[index]))
+
+    actual_flat = np.array([entry[1] for entry in diagnostics])
+    expected_flat = np.array([entry[2] for entry in diagnostics])
+    diff = actual_flat - expected_flat
+    abs_diff = np.abs(diff)
+    rel_den = np.maximum(np.abs(expected_flat), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    max_abs_index, max_abs_actual, max_abs_expected = diagnostics[max_abs_idx]
+    max_rel_index, max_rel_actual, max_rel_expected = diagnostics[max_rel_idx]
+    print(
+        f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
+        f"at index {max_abs_index} (actual={max_abs_actual}, expected={max_abs_expected})"
+    )
+    print(
+        f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
+        f"at index {max_rel_index} (actual={max_rel_actual}, expected={max_rel_expected})"
+    )
+    assert np.allclose(actual_flat, expected_flat, atol=1e-10, rtol=0)
+
+
+def test_jax_ComputeSplineCoefficientsND_jit_smoke():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    nodes = (xi, yi, zi)
+
+    f = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
+    xx, yy, zz = np.meshgrid(xi, yi, zi, indexing="ij")
+    F = f(xx, yy, zz)
+
+    non_jit = np.asarray(TPI_jax.compute_spline_coefficients_nd(nodes, F))
+    jit_fn = jax.jit(TPI_jax.compute_spline_coefficients_nd)
+    jit_coeffs = np.asarray(jit_fn(nodes, F))
+
+    assert np.allclose(jit_coeffs, non_jit, atol=1e-10, rtol=0)
+
+
 def test_SplineMatrix():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12])
     b = TPI.BsplineBasis1D(x1)

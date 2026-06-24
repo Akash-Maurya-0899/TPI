@@ -230,30 +230,100 @@ class BsplineBasis1D:
 
     def AssembleSplineMatrix(self):
         """Assemble the cubic spline matrix with not-a-knot boundary conditions."""
-        xi = self.xi
-        knots = self.knots
-
-        phi_internal = jax.vmap(lambda x: _evaluate_cubic_bspline_basis_jax(knots, x))(xi)
-
-        xi12mean = 0.5 * (xi[0] + xi[1])
-        xi23mean = 0.5 * (xi[1] + xi[2])
-        xim32mean = 0.5 * (xi[-3] + xi[-2])
-        xim21mean = 0.5 * (xi[-2] + xi[-1])
-
-        first_row = (
-            _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xi12mean)
-            - _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xi23mean)
-        )
-        last_row = (
-            _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xim32mean)
-            - _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xim21mean)
-        )
-
-        phi = jnp.vstack((first_row, phi_internal, last_row))
-        return phi, knots
+        return _assemble_spline_matrix_jax(self.xi)
 
 
 def construct_knots(nodes):
     """Construct the cubic B-spline knot vector matching GSL's convention."""
     nodes_array = _as_valid_nodes(nodes)
     return _construct_knots_jax(nodes_array)
+
+
+def _assemble_spline_matrix_jax(nodes):
+    """Assemble the cubic spline matrix for a validated 1D node array."""
+    knots = _construct_knots_jax(nodes)
+    phi_internal = jax.vmap(lambda x: _evaluate_cubic_bspline_basis_jax(knots, x))(nodes)
+
+    xi12mean = 0.5 * (nodes[0] + nodes[1])
+    xi23mean = 0.5 * (nodes[1] + nodes[2])
+    xim32mean = 0.5 * (nodes[-3] + nodes[-2])
+    xim21mean = 0.5 * (nodes[-2] + nodes[-1])
+
+    first_row = (
+        _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xi12mean)
+        - _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xi23mean)
+    )
+    last_row = (
+        _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xim32mean)
+        - _evaluate_cubic_bspline_3rd_derivatives_jax(knots, xim21mean)
+    )
+
+    phi = jnp.vstack((first_row, phi_internal, last_row))
+    return phi, knots
+
+
+def _solve_axis_system(matrix, tensor, axis):
+    rhs = jnp.moveaxis(tensor, axis, 0)
+    leading = rhs.shape[0]
+    solved = jnp.linalg.solve(matrix, rhs.reshape((leading, -1)))
+    solved = solved.reshape(rhs.shape)
+    return jnp.moveaxis(solved, 0, axis)
+
+
+def compute_spline_coefficients_nd(nodes, F):
+    """Compute tensor-product spline coefficients for validated nodes and data."""
+    nodes = tuple(jnp.asarray(node, dtype=jnp.float64) for node in nodes)
+    F = jnp.asarray(F, dtype=jnp.float64)
+
+    dims = tuple(int(node.shape[0]) for node in nodes)
+    if F.shape != dims:
+        raise ValueError(f"Data on TP grid should have shape {list(dims)}")
+
+    coeffs = jnp.pad(F, [(1, 1)] * len(nodes), mode="constant")
+    for axis in range(len(nodes) - 1, -1, -1):
+        phi, _ = _assemble_spline_matrix_jax(nodes[axis])
+        coeffs = _solve_axis_system(phi, coeffs, axis)
+    return coeffs
+
+
+class TP_Interpolant_ND:
+    """JAX-side tensor-product spline interpolant helper."""
+
+    def __init__(self, nodes, coeffs=None, F=None):
+        if nodes is None:
+            raise ValueError("Missing input nodes.")
+        if not isinstance(nodes, (list, tuple)):
+            raise TypeError("Expected list of numpy.ndarrays.")
+        if not np.array(list(map(lambda x: isinstance(x, np.ndarray), nodes))).all():
+            raise TypeError("Expected list of numpy.ndarrays.")
+
+        self.nodes = tuple(_as_valid_nodes(node) for node in nodes)
+        self.n = len(self.nodes)
+        self.c = None
+        self.knots_list = None
+        self.bases = None
+
+        self.TPInterpolationSetupND()
+        if coeffs is not None:
+            self.SetSplineCoefficientsND(coeffs)
+        if F is not None:
+            self.ComputeSplineCoefficientsND(F)
+
+    def TPInterpolationSetupND(self):
+        self.bases = tuple(BsplineBasis1D(np.asarray(node)) for node in self.nodes)
+        self.knots_list = tuple(base.knots for base in self.bases)
+
+    def ComputeSplineCoefficientsND(self, F):
+        coeffs = compute_spline_coefficients_nd(self.nodes, F)
+        self.c = coeffs
+        return coeffs
+
+    def GetSplineCoefficientsND(self):
+        return self.c
+
+    def SetSplineCoefficientsND(self, coeffs):
+        dims = tuple(len(node) + 2 for node in self.nodes)
+        coeffs = jnp.asarray(coeffs, dtype=jnp.float64)
+        if coeffs.shape != dims:
+            raise ValueError(f"Spline coefficients should have shape {list(dims)}")
+        self.c = coeffs
