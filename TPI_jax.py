@@ -103,6 +103,85 @@ def _evaluate_cubic_bspline_basis_jax(knots, x):
     return result
 
 
+def _evaluate_cubic_bspline_3rd_derivatives_jax(knots, x):
+    """Evaluate the full cubic B-spline 3rd derivative basis on a clamped knot vector."""
+    knots = jnp.asarray(knots, dtype=jnp.float64)
+    x = jnp.asarray(x, dtype=jnp.float64)
+    nbasis = knots.shape[0] - 4
+
+    span_count = knots.shape[0] - 7
+    span_idx = jnp.arange(span_count, dtype=jnp.int64)
+    span_left = knots[3:-4]
+    span_right = knots[4:-3]
+    span_mask = (span_left <= x) & (
+        (x < span_right) | ((span_idx == span_idx[-1]) & (x <= span_right))
+    )
+    span = jnp.sum(span_idx * span_mask.astype(span_idx.dtype)) + 3
+
+    p = 3
+    ndu = jnp.zeros((p + 1, p + 1), dtype=jnp.float64)
+    ndu = ndu.at[0, 0].set(1.0)
+    left = jnp.zeros(p + 1, dtype=jnp.float64)
+    right = jnp.zeros(p + 1, dtype=jnp.float64)
+
+    for j in range(1, p + 1):
+        left = left.at[j].set(x - knots[span + 1 - j])
+        right = right.at[j].set(knots[span + j] - x)
+        saved = 0.0
+        for r in range(j):
+            ndu = ndu.at[j, r].set(right[r + 1] + left[j - r])
+            denom = ndu[j, r]
+            temp = jnp.where(denom != 0.0, ndu[r, j - 1] / denom, 0.0)
+            ndu = ndu.at[r, j].set(saved + right[r + 1] * temp)
+            saved = left[j - r] * temp
+        ndu = ndu.at[j, j].set(saved)
+
+    ders = jnp.zeros((p + 1, p + 1), dtype=jnp.float64)
+    ders = ders.at[0].set(ndu[:, p])
+
+    for r in range(p + 1):
+        a = jnp.zeros((2, p + 1), dtype=jnp.float64)
+        a = a.at[0, 0].set(1.0)
+        s1 = 0
+        s2 = 1
+
+        for k in range(1, p + 1):
+            d = 0.0
+            rk = r - k
+            pk = p - k
+
+            if r >= k:
+                denom = ndu[pk + 1, rk]
+                value = jnp.where(denom != 0.0, a[s1, 0] / denom, 0.0)
+                a = a.at[s2, 0].set(value)
+                d = value * ndu[rk, pk]
+
+            j1 = 1 if rk >= -1 else -rk
+            j2 = k - 1 if (r - 1) <= pk else p - r
+            for j in range(j1, j2 + 1):
+                denom = ndu[pk + 1, rk + j]
+                value = jnp.where(denom != 0.0, (a[s1, j] - a[s1, j - 1]) / denom, 0.0)
+                a = a.at[s2, j].set(value)
+                d = d + value * ndu[rk + j, pk]
+
+            if r <= pk:
+                denom = ndu[pk + 1, r]
+                value = jnp.where(denom != 0.0, -a[s1, k - 1] / denom, 0.0)
+                a = a.at[s2, k].set(value)
+                d = d + value * ndu[r, pk]
+
+            ders = ders.at[k, r].set(d)
+            s1, s2 = s2, s1
+
+    ders = ders.at[1].set(ders[1] * 3.0)
+    ders = ders.at[2].set(ders[2] * 6.0)
+    ders = ders.at[3].set(ders[3] * 6.0)
+
+    result = jnp.zeros(nbasis, dtype=jnp.float64)
+    result = jax.lax.dynamic_update_slice(result, ders[3], (span - 3,))
+    return result
+
+
 class BsplineBasis1D:
     """JAX-side 1D cubic B-spline basis helper."""
 
@@ -129,6 +208,25 @@ class BsplineBasis1D:
             )
 
         return _evaluate_cubic_bspline_basis_jax(self.knots, x_val)
+
+    def EvaluateBsplines3rdDerivatives(self, x):
+        if isinstance(x, jax_core.Tracer):
+            return _evaluate_cubic_bspline_3rd_derivatives_jax(self.knots, x)
+
+        x_arr = np.asarray(x, dtype=np.float64)
+        if x_arr.ndim != 0:
+            raise ValueError("Evaluation point x must be scalar.")
+
+        x_val = float(x_arr)
+        x_min = float(np.asarray(self.xi[0]))
+        x_max = float(np.asarray(self.xi[-1]))
+        if x_val < x_min or x_val > x_max:
+            raise ValueError(
+                f"Error: Bspline_basis_3rd_derivative_1D(): x: {x_val} is outside of knots "
+                f"vector with bounds [{x_min}, {x_max}]!"
+            )
+
+        return _evaluate_cubic_bspline_3rd_derivatives_jax(self.knots, x_val)
 
 
 def construct_knots(nodes):

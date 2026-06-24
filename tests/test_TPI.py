@@ -300,6 +300,200 @@ def test_jax_EvaluateBsplines_jit_smoke():
     assert np.allclose(jit_eval, non_jit, atol=1e-10, rtol=0)
 
 
+def test_jax_EvaluateBsplines3rdDerivatives_matches_gsl():
+    x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0])
+    basis = TPI_jax.BsplineBasis1D(x1)
+    cases = [
+        (
+            1.1,
+            np.array([
+                -0.647878198898607,
+                1.1665856818918043,
+                -0.6358035017285604,
+                0.11709601873536303,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ]),
+        ),
+        (
+            2.0,
+            np.array([
+                -0.647878198898607,
+                1.1665856818918043,
+                -0.6358035017285604,
+                0.11709601873536303,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ]),
+        ),
+        (
+            3.5,
+            np.array([
+                0.0,
+                -0.19736842105263175,
+                0.45621225194132903,
+                -0.3882657463330459,
+                0.1294219154443486,
+                0.0,
+                0.0,
+                0.0,
+            ]),
+        ),
+        (
+            4.7,
+            np.array([
+                0.0,
+                -0.19736842105263175,
+                0.45621225194132903,
+                -0.3882657463330459,
+                0.1294219154443486,
+                0.0,
+                0.0,
+                0.0,
+            ]),
+        ),
+        (
+            5.05,
+            np.array([
+                0.0,
+                -0.19736842105263175,
+                0.45621225194132903,
+                -0.3882657463330459,
+                0.1294219154443486,
+                0.0,
+                0.0,
+                0.0,
+            ]),
+        ),
+        (
+            5.15,
+            np.array([
+                0.0,
+                0.0,
+                -0.11709601873536298,
+                0.34571205531392873,
+                -0.32720619728052763,
+                0.09859016070196189,
+                0.0,
+                0.0,
+            ]),
+        ),
+        (
+            6.3,
+            np.array([
+                0.0,
+                0.0,
+                -0.11709601873536298,
+                0.34571205531392873,
+                -0.32720619728052763,
+                0.09859016070196189,
+                0.0,
+                0.0,
+            ]),
+        ),
+        (
+            8.0,
+            np.array([
+                0.0,
+                0.0,
+                0.0,
+                -0.11152001784320277,
+                0.2963765691593813,
+                -0.308864487824115,
+                0.12400793650793648,
+                0.0,
+            ]),
+        ),
+        (
+            9.3,
+            np.array([
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -0.06709608158883523,
+                0.3350144629331426,
+                -0.5727499618960528,
+                0.30483158055174536,
+            ]),
+        ),
+        (
+            10.5,
+            np.array([
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -0.06709608158883523,
+                0.3350144629331426,
+                -0.5727499618960528,
+                0.30483158055174536,
+            ]),
+        ),
+        (
+            12.0,
+            np.array([
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                -0.06709608158883523,
+                0.3350144629331426,
+                -0.5727499618960528,
+                0.30483158055174536,
+            ]),
+        ),
+    ]
+
+    diagnostics = []
+
+    for case_index, (x, expected) in enumerate(cases):
+        actual = np.asarray(basis.EvaluateBsplines3rdDerivatives(x))
+        assert actual.shape == expected.shape
+        diagnostics.extend(
+            [
+                (case_index, x, basis_index, actual[basis_index], expected[basis_index])
+                for basis_index in range(expected.size)
+            ]
+        )
+
+    actual_flat = np.array([entry[3] for entry in diagnostics])
+    expected_flat = np.array([entry[4] for entry in diagnostics])
+    diff = actual_flat - expected_flat
+    abs_diff = np.abs(diff)
+    rel_den = np.maximum(np.abs(expected_flat), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    max_abs_case, max_abs_x, max_abs_basis, max_abs_actual, max_abs_expected = diagnostics[max_abs_idx]
+    max_rel_case, max_rel_x, max_rel_basis, max_rel_actual, max_rel_expected = diagnostics[max_rel_idx]
+    print(
+        f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
+        f"at case {max_abs_case} (x={max_abs_x}, basis_index={max_abs_basis}, "
+        f"actual={max_abs_actual}, expected={max_abs_expected})"
+    )
+    print(
+        f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
+        f"at case {max_rel_case} (x={max_rel_x}, basis_index={max_rel_basis}, "
+        f"actual={max_rel_actual}, expected={max_rel_expected})"
+    )
+    assert np.allclose(actual_flat, expected_flat, atol=1e-10, rtol=0)
+
+
+def test_jax_EvaluateBsplines3rdDerivatives_jit_smoke():
+    x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0])
+    basis = TPI_jax.BsplineBasis1D(x1)
+    x = 4.7
+
+    non_jit = np.asarray(basis.EvaluateBsplines3rdDerivatives(x))
+    jit_eval = np.asarray(jax.jit(basis.EvaluateBsplines3rdDerivatives)(x))
+    assert np.allclose(jit_eval, non_jit, atol=1e-10, rtol=0)
+
+
 def test_SplineMatrix():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12])
     b = TPI.BsplineBasis1D(x1)
