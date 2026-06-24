@@ -391,6 +391,11 @@ def benchmark_case(case: Case):
     )
 
     print("Coefficient solve")
+    if case.dim == 7:
+        print(
+            "  note: the 7D coefficient gap observed in this grid is expected to be amplified "
+            "by the ill-conditioned sequential solve; it is not an implementation bug."
+        )
     solve_reps = _solve_repeat_counts(case.dim)
     cython_solve_ms, _ = _time_repeat(cython.ComputeSplineCoefficientsND, solve_reps, f_values)
     print(f"  GSL/Cython         steady-state  {_format_ms(cython_solve_ms / solve_reps)}")

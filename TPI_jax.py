@@ -276,7 +276,12 @@ def _solve_axis_system(matrix, tensor, axis):
 
 
 def compute_spline_coefficients_nd(nodes, F):
-    """Compute tensor-product spline coefficients for validated nodes and data."""
+    """Compute tensor-product spline coefficients for validated nodes and data.
+
+    The implementation performs sequential 1D solves along each axis. On grids with
+    high spline-matrix condition numbers, tiny differences in assembled matrices or
+    floating-point ordering can be amplified into larger coefficient differences.
+    """
     nodes = tuple(jnp.asarray(node, dtype=jnp.float64) for node in nodes)
     F = jnp.asarray(F, dtype=jnp.float64)
 
