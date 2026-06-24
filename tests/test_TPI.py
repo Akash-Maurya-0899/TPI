@@ -610,49 +610,62 @@ def test_jax_ComputeSplineCoefficientsND_jit_smoke():
 
 def test_jax_TPInterpolationND_matches_gsl():
     np.set_printoptions(precision=18)
-    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
-    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
-    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
-    nodes = [xi, yi, zi]
+    xi1 = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    f1 = lambda x: np.cos(10.0 * x)
+    F1 = f1(xi1)
+    TPint1 = TPI_jax.TP_Interpolant_ND([xi1])
+    TPint1.ComputeSplineCoefficientsND(F1)
 
-    f = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
-    xx, yy, zz = np.meshgrid(xi, yi, zi, indexing="ij")
-    F = f(xx, yy, zz)
+    xi2 = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi2 = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    f2 = lambda x, y: np.sin(x) * np.arccos(y)
+    xx2, yy2 = np.meshgrid(xi2, yi2, indexing="ij")
+    F2 = f2(xx2, yy2)
+    TPint2 = TPI_jax.TP_Interpolant_ND([xi2, yi2])
+    TPint2.ComputeSplineCoefficientsND(F2)
 
-    TPint = TPI_jax.TP_Interpolant_ND(nodes)
-    TPint.ComputeSplineCoefficientsND(F)
+    xi3 = xi2
+    yi3 = yi2
+    zi3 = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    f3 = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
+    xx3, yy3, zz3 = np.meshgrid(xi3, yi3, zi3, indexing="ij")
+    F3 = f3(xx3, yy3, zz3)
+    TPint3 = TPI_jax.TP_Interpolant_ND([xi3, yi3, zi3])
+    TPint3.ComputeSplineCoefficientsND(F3)
 
     cases = [
-        (np.array([0.1692602, 0.2827312351474, -0.26624193]), 0.16576975057631646),
-        (np.array([0.11, -0.2, 0.4]), 0.2902256664884906),
-        (np.array([0.247, 0.95, 0.8]), 0.17279609554416436),
-        (np.array([0.2, 0.0, -0.6]), 0.17126712868162106),
-        (np.array([0.235, 0.6, 0.1]), 0.23862120199268544),
+        ("1D", TPint1, np.array([0.16]),  -0.029174542430287713),
+        ("2D", TPint2, np.array([0.16, 0.28]), 0.20507808901038865),
+        ("3D", TPint3, np.array([0.1692602, 0.2827312351474, -0.26624193]), 0.16576975057631646),
+        ("3D", TPint3, np.array([0.11, -0.2, 0.4]), 0.2902256664884906),
+        ("3D", TPint3, np.array([0.247, 0.95, 0.8]), 0.17279609554416436),
+        ("3D", TPint3, np.array([0.2, 0.0, -0.6]), 0.17126712868162106),
+        ("3D", TPint3, np.array([0.235, 0.6, 0.1]), 0.23862120199268544),
     ]
 
     diagnostics = []
-    for case_index, (point, expected) in enumerate(cases):
-        actual = np.asarray(TPint.TPInterpolationND(point))
-        diagnostics.append((case_index, point, actual, expected))
+    for case_index, (label, interpolant, point, expected) in enumerate(cases):
+        actual = np.asarray(interpolant.TPInterpolationND(point))
+        diagnostics.append((case_index, label, point, actual, expected))
 
-    actual_flat = np.array([entry[2] for entry in diagnostics], dtype=np.float64)
-    expected_flat = np.array([entry[3] for entry in diagnostics], dtype=np.float64)
+    actual_flat = np.array([float(np.asarray(entry[3])) for entry in diagnostics], dtype=np.float64)
+    expected_flat = np.array([float(entry[4]) for entry in diagnostics], dtype=np.float64)
     diff = actual_flat - expected_flat
     abs_diff = np.abs(diff)
     rel_den = np.maximum(np.abs(expected_flat), np.finfo(np.float64).tiny)
     rel_diff = abs_diff / rel_den
     max_abs_idx = int(np.argmax(abs_diff))
     max_rel_idx = int(np.argmax(rel_diff))
-    max_abs_case, max_abs_point, max_abs_actual, max_abs_expected = diagnostics[max_abs_idx]
-    max_rel_case, max_rel_point, max_rel_actual, max_rel_expected = diagnostics[max_rel_idx]
+    max_abs_case, max_abs_label, max_abs_point, max_abs_actual, max_abs_expected = diagnostics[max_abs_idx]
+    max_rel_case, max_rel_label, max_rel_point, max_rel_actual, max_rel_expected = diagnostics[max_rel_idx]
     print(
         f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
-        f"at case {max_abs_case} (point={max_abs_point}, "
+        f"at case {max_abs_case} ({max_abs_label}, point={max_abs_point}, "
         f"actual={max_abs_actual}, expected={max_abs_expected})"
     )
     print(
         f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
-        f"at case {max_rel_case} (point={max_rel_point}, "
+        f"at case {max_rel_case} ({max_rel_label}, point={max_rel_point}, "
         f"actual={max_rel_actual}, expected={max_rel_expected})"
     )
     assert np.allclose(actual_flat, expected_flat, atol=1e-10, rtol=0)
