@@ -10,6 +10,7 @@ import numpy as np
 
 import jax
 from jax import core as jax_core
+import jax.scipy.linalg as jax_linalg
 
 jax.config.update("jax_enable_x64", True)
 
@@ -259,6 +260,12 @@ def _assemble_spline_matrix_jax(nodes):
     return phi, knots
 
 
+def _factor_spline_matrix_jax(nodes):
+    """Factor the cubic spline matrix for a validated 1D node array."""
+    phi, _ = _assemble_spline_matrix_jax(nodes)
+    return jax_linalg.lu_factor(phi)
+
+
 def _solve_axis_system(matrix, tensor, axis):
     rhs = jnp.moveaxis(tensor, axis, 0)
     leading = rhs.shape[0]
@@ -267,7 +274,15 @@ def _solve_axis_system(matrix, tensor, axis):
     return jnp.moveaxis(solved, 0, axis)
 
 
-def compute_spline_coefficients_nd(nodes, F):
+def _solve_axis_system_from_lu(lu_and_piv, tensor, axis):
+    rhs = jnp.moveaxis(tensor, axis, 0)
+    leading = rhs.shape[0]
+    solved = jax_linalg.lu_solve(lu_and_piv, rhs.reshape((leading, -1)))
+    solved = solved.reshape(rhs.shape)
+    return jnp.moveaxis(solved, 0, axis)
+
+
+def _compute_spline_coefficients_nd(nodes, F, spline_matrix_factors=None):
     """Compute tensor-product spline coefficients for validated nodes and data.
 
     The implementation performs sequential 1D solves along each axis. On grids with
@@ -282,10 +297,15 @@ def compute_spline_coefficients_nd(nodes, F):
         raise ValueError(f"Data on TP grid should have shape {list(dims)}")
 
     coeffs = jnp.pad(F, [(1, 1)] * len(nodes), mode="constant")
+    if spline_matrix_factors is None:
+        spline_matrix_factors = tuple(_factor_spline_matrix_jax(node) for node in nodes)
     for axis in range(len(nodes) - 1, -1, -1):
-        phi, _ = _assemble_spline_matrix_jax(nodes[axis])
-        coeffs = _solve_axis_system(phi, coeffs, axis)
+        coeffs = _solve_axis_system_from_lu(spline_matrix_factors[axis], coeffs, axis)
     return coeffs
+
+
+def compute_spline_coefficients_nd(nodes, F):
+    return _compute_spline_coefficients_nd(nodes, F)
 
 
 _EINSUM_LABELS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -307,6 +327,7 @@ class TP_Interpolant_ND:
         self.c = None
         self.knots_list = None
         self.bases = None
+        self.spline_matrix_factors = None
 
         self.TPInterpolationSetupND()
         if coeffs is not None:
@@ -317,9 +338,10 @@ class TP_Interpolant_ND:
     def TPInterpolationSetupND(self):
         self.bases = tuple(BsplineBasis1D(np.asarray(node)) for node in self.nodes)
         self.knots_list = tuple(base.knots for base in self.bases)
+        self.spline_matrix_factors = tuple(_factor_spline_matrix_jax(node) for node in self.nodes)
 
     def ComputeSplineCoefficientsND(self, F):
-        coeffs = compute_spline_coefficients_nd(self.nodes, F)
+        coeffs = _compute_spline_coefficients_nd(self.nodes, F, self.spline_matrix_factors)
         self.c = coeffs
         return coeffs
 

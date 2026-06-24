@@ -757,6 +757,52 @@ def test_jax_ComputeSplineCoefficientsND_matches_gsl():
     assert np.allclose(actual_flat, expected_flat, atol=1e-10, rtol=0)
 
 
+def test_jax_ComputeSplineCoefficientsND_uses_cached_lu_factors(monkeypatch):
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    nodes = [xi, yi, zi]
+
+    f = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
+    xx, yy, zz = np.meshgrid(xi, yi, zi, indexing="ij")
+    F = f(xx, yy, zz)
+
+    expected = np.asarray(TPI_jax.compute_spline_coefficients_nd(nodes, F))
+
+    TPint = TPI_jax.TP_Interpolant_ND(nodes)
+    TPint.TPInterpolationSetupND()
+    assert hasattr(TPint, "spline_matrix_factors")
+    assert len(TPint.spline_matrix_factors) == len(nodes)
+
+    def _fail_if_reassembled(*args, **kwargs):
+        raise AssertionError("spline matrices should be cached during setup")
+
+    monkeypatch.setattr(TPI_jax, "_assemble_spline_matrix_jax", _fail_if_reassembled)
+
+    TPint.ComputeSplineCoefficientsND(F)
+    actual = np.asarray(TPint.GetSplineCoefficientsND())
+
+    diff = actual - expected
+    abs_diff = np.abs(diff)
+    rel_den = np.maximum(np.abs(expected), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    abs_diff_flat = abs_diff.reshape(-1)
+    rel_diff_flat = rel_diff.reshape(-1)
+    max_abs_idx = int(np.argmax(abs_diff_flat))
+    max_rel_idx = int(np.argmax(rel_diff_flat))
+    max_abs_index = np.unravel_index(max_abs_idx, actual.shape)
+    max_rel_index = np.unravel_index(max_rel_idx, actual.shape)
+    print(
+        f"max abs diff: {float(abs_diff_flat[max_abs_idx]):.3e} "
+        f"at index={max_abs_index} (actual={actual[max_abs_index]}, expected={expected[max_abs_index]})"
+    )
+    print(
+        f"max rel diff: {float(rel_diff_flat[max_rel_idx]):.3e} "
+        f"at index={max_rel_index} (actual={actual[max_rel_index]}, expected={expected[max_rel_index]})"
+    )
+    assert np.allclose(actual, expected, atol=1e-10, rtol=0)
+
+
 def test_jax_ComputeSplineCoefficientsND_jit_smoke():
     xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
     yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
