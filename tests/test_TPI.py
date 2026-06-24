@@ -694,6 +694,118 @@ def test_jax_TPInterpolationND_jit_smoke():
     assert np.allclose(jit_eval, non_jit, atol=1e-10, rtol=0)
 
 
+def test_jax_TPInterpolationND_batched_matches_scalar():
+    xi1 = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    f1 = lambda x: np.cos(10.0 * x)
+    F1 = f1(xi1)
+    TPint1 = TPI_jax.TP_Interpolant_ND([xi1])
+    TPint1.ComputeSplineCoefficientsND(F1)
+
+    xi2 = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi2 = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    f2 = lambda x, y: np.sin(x) * np.arccos(y)
+    xx2, yy2 = np.meshgrid(xi2, yi2, indexing="ij")
+    F2 = f2(xx2, yy2)
+    TPint2 = TPI_jax.TP_Interpolant_ND([xi2, yi2])
+    TPint2.ComputeSplineCoefficientsND(F2)
+
+    xi3 = xi2
+    yi3 = yi2
+    zi3 = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    f3 = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
+    xx3, yy3, zz3 = np.meshgrid(xi3, yi3, zi3, indexing="ij")
+    F3 = f3(xx3, yy3, zz3)
+    TPint3 = TPI_jax.TP_Interpolant_ND([xi3, yi3, zi3])
+    TPint3.ComputeSplineCoefficientsND(F3)
+
+    cases = [
+        ("1D", TPint1, np.array([[0.16], [0.123], [0.249]])),
+        ("2D", TPint2, np.array([[0.16, 0.28], [0.123, -0.2], [0.2, 0.0]])),
+        (
+            "3D",
+            TPint3,
+            np.array(
+                [
+                    [0.1692602, 0.2827312351474, -0.26624193],
+                    [0.11, -0.2, 0.4],
+                    [0.235, 0.6, 0.1],
+                ]
+            ),
+        ),
+    ]
+
+    diagnostics = []
+    for case_index, (label, interpolant, batch_points) in enumerate(cases):
+        scalar_values = np.array([float(np.asarray(interpolant.TPInterpolationND(point))) for point in batch_points])
+        batch_values = np.asarray(interpolant.TPInterpolationND_batched(batch_points))
+        diagnostics.extend(
+            [
+                (case_index, label, point_index, batch_points[point_index], scalar_values[point_index], batch_values[point_index])
+                for point_index in range(batch_points.shape[0])
+            ]
+        )
+
+    scalar_flat = np.array([entry[4] for entry in diagnostics], dtype=np.float64)
+    batch_flat = np.array([entry[5] for entry in diagnostics], dtype=np.float64)
+    diff = batch_flat - scalar_flat
+    abs_diff = np.abs(diff)
+    rel_den = np.maximum(np.abs(scalar_flat), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    max_abs_case, max_abs_label, max_abs_point_index, max_abs_point, max_abs_scalar, max_abs_batch = diagnostics[max_abs_idx]
+    max_rel_case, max_rel_label, max_rel_point_index, max_rel_point, max_rel_scalar, max_rel_batch = diagnostics[max_rel_idx]
+    print(
+        f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
+        f"at case {max_abs_case} ({max_abs_label}, point_index={max_abs_point_index}, "
+        f"point={max_abs_point}, scalar={max_abs_scalar}, batch={max_abs_batch})"
+    )
+    print(
+        f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
+        f"at case {max_rel_case} ({max_rel_label}, point_index={max_rel_point_index}, "
+        f"point={max_rel_point}, scalar={max_rel_scalar}, batch={max_rel_batch})"
+    )
+    assert np.allclose(batch_flat, scalar_flat, atol=1e-14, rtol=0)
+
+
+def test_jax_TPInterpolationND_batched_jit_smoke():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    nodes = [xi, yi, zi]
+
+    f = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
+    xx, yy, zz = np.meshgrid(xi, yi, zi, indexing="ij")
+    F = f(xx, yy, zz)
+
+    TPint = TPI_jax.TP_Interpolant_ND(nodes)
+    TPint.ComputeSplineCoefficientsND(F)
+
+    batch_1 = np.array(
+        [
+            [0.1692602, 0.2827312351474, -0.26624193],
+            [0.11, -0.2, 0.4],
+            [0.235, 0.6, 0.1],
+        ]
+    )
+    batch_2 = np.array(
+        [
+            [0.123, -0.2, 0.4],
+            [0.247, 0.95, 0.8],
+            [0.2, 0.0, -0.6],
+        ]
+    )
+
+    non_jit_1 = np.asarray(TPint.TPInterpolationND_batched(batch_1))
+    non_jit_2 = np.asarray(TPint.TPInterpolationND_batched(batch_2))
+    jit_fn = jax.jit(TPint.TPInterpolationND_batched)
+    jit_1 = np.asarray(jit_fn(batch_1))
+    jit_2 = np.asarray(jit_fn(batch_2))
+
+    assert np.allclose(jit_1, non_jit_1, atol=1e-10, rtol=0)
+    assert np.allclose(jit_2, non_jit_2, atol=1e-10, rtol=0)
+
+
 def test_SplineMatrix():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12])
     b = TPI.BsplineBasis1D(x1)

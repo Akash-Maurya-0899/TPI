@@ -377,6 +377,37 @@ class TP_Interpolant_ND:
         equation = f"{basis_labels},{coeff_labels}->"
         return jnp.einsum(equation, *bases, coeff_block)
 
+    def TPInterpolationND_batched(self, X):
+        if self.c is None:
+            raise ValueError("Spline coefficients have not been set.")
+
+        if isinstance(X, jax_core.Tracer):
+            X_arr = jnp.asarray(X, dtype=jnp.float64)
+            return self._TPInterpolationND_batched_jax(X_arr)
+
+        X_arr = np.asarray(X, dtype=np.float64)
+        if X_arr.ndim != 2:
+            raise ValueError("Evaluation batch X must be two-dimensional!")
+        if X_arr.shape[1] != self.n:
+            raise ValueError(
+                f"Expected X to have shape (M, {self.n}), but got shape {X_arr.shape}"
+            )
+
+        for row_index, point in enumerate(X_arr):
+            for axis, node in enumerate(self.nodes):
+                x_min = float(np.asarray(node[0]))
+                x_max = float(np.asarray(node[-1]))
+                if point[axis] < x_min or point[axis] > x_max:
+                    raise ValueError(
+                        f"TP_Interpolation_ND: X[{row_index}, {axis}] = {point[axis]} "
+                        f"is outside of knots vector [{x_min}, {x_max}]!"
+                    )
+
+        return self._TPInterpolationND_batched_jax(jnp.asarray(X_arr, dtype=jnp.float64))
+
+    def _TPInterpolationND_batched_jax(self, X):
+        return jax.vmap(self._TPInterpolationND_jax)(X)
+
     def __call__(self, X):
         X_arr = np.atleast_1d(np.asarray(X, dtype=np.float64))
         if X_arr.ndim != 1:
