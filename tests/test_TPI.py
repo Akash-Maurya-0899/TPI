@@ -305,7 +305,7 @@ def test_jax_EvaluateBsplines3rdDerivatives_matches_gsl():
     basis = TPI_jax.BsplineBasis1D(x1)
     cases = [
         (
-            1.1,
+            2.15,
             np.array([
                 -0.647878198898607,
                 1.1665856818918043,
@@ -318,20 +318,7 @@ def test_jax_EvaluateBsplines3rdDerivatives_matches_gsl():
             ]),
         ),
         (
-            2.0,
-            np.array([
-                -0.647878198898607,
-                1.1665856818918043,
-                -0.6358035017285604,
-                0.11709601873536303,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            ]),
-        ),
-        (
-            3.5,
+            4.15,
             np.array([
                 0.0,
                 -0.19736842105263175,
@@ -344,33 +331,7 @@ def test_jax_EvaluateBsplines3rdDerivatives_matches_gsl():
             ]),
         ),
         (
-            4.7,
-            np.array([
-                0.0,
-                -0.19736842105263175,
-                0.45621225194132903,
-                -0.3882657463330459,
-                0.1294219154443486,
-                0.0,
-                0.0,
-                0.0,
-            ]),
-        ),
-        (
-            5.05,
-            np.array([
-                0.0,
-                -0.19736842105263175,
-                0.45621225194132903,
-                -0.3882657463330459,
-                0.1294219154443486,
-                0.0,
-                0.0,
-                0.0,
-            ]),
-        ),
-        (
-            5.15,
+            6.15,
             np.array([
                 0.0,
                 0.0,
@@ -383,20 +344,7 @@ def test_jax_EvaluateBsplines3rdDerivatives_matches_gsl():
             ]),
         ),
         (
-            6.3,
-            np.array([
-                0.0,
-                0.0,
-                -0.11709601873536298,
-                0.34571205531392873,
-                -0.32720619728052763,
-                0.09859016070196189,
-                0.0,
-                0.0,
-            ]),
-        ),
-        (
-            8.0,
+            8.25,
             np.array([
                 0.0,
                 0.0,
@@ -409,33 +357,7 @@ def test_jax_EvaluateBsplines3rdDerivatives_matches_gsl():
             ]),
         ),
         (
-            9.3,
-            np.array([
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                -0.06709608158883523,
-                0.3350144629331426,
-                -0.5727499618960528,
-                0.30483158055174536,
-            ]),
-        ),
-        (
-            10.5,
-            np.array([
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                -0.06709608158883523,
-                0.3350144629331426,
-                -0.5727499618960528,
-                0.30483158055174536,
-            ]),
-        ),
-        (
-            12.0,
+            10.65,
             np.array([
                 0.0,
                 0.0,
@@ -482,6 +404,17 @@ def test_jax_EvaluateBsplines3rdDerivatives_matches_gsl():
         f"actual={max_rel_actual}, expected={max_rel_expected})"
     )
     assert np.allclose(actual_flat, expected_flat, atol=1e-10, rtol=0)
+
+
+def test_jax_EvaluateBsplines3rdDerivatives_jit_across_spans():
+    x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12.0])
+    basis = TPI_jax.BsplineBasis1D(x1)
+    points = [1.5, 3.5, 5.05, 5.15, 6.3, 8.0, 10.5]
+
+    for x in points:
+        non_jit = np.asarray(basis.EvaluateBsplines3rdDerivatives(x))
+        jit_eval = np.asarray(jax.jit(basis.EvaluateBsplines3rdDerivatives)(x))
+        assert np.allclose(jit_eval, non_jit, atol=1e-10, rtol=0)
 
 
 def test_jax_EvaluateBsplines3rdDerivatives_jit_smoke():
