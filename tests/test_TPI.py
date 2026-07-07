@@ -1400,6 +1400,48 @@ def test_jax_BsplineBasis1D_range_errors_and_endpoint_acceptance():
             basis.EvaluateBsplines3rdDerivatives(x)
 
 
+def test_SetSplineCoefficientsND_roundtrip_interpolation_matches_compute():
+    for dim, nodes, gsl_interp, _ in _single_chain_interpolant_cases():
+        points = _single_chain_interior_points(nodes, count=10)
+        computed_values = np.asarray(
+            [gsl_interp.TPInterpolationND(point) for point in points], dtype=np.float64
+        )
+
+        transferred = TPI.TP_Interpolant_ND(list(nodes))
+        transferred.SetSplineCoefficientsND(gsl_interp.GetSplineCoefficientsND())
+        transferred_values = np.asarray(
+            [transferred.TPInterpolationND(point) for point in points], dtype=np.float64
+        )
+
+        max_abs = float(np.max(np.abs(transferred_values - computed_values)))
+        print(f"dim={dim} set/compute roundtrip max abs diff: {max_abs:.3e}")
+        assert np.allclose(transferred_values, computed_values, atol=1e-14, rtol=0)
+
+
+def test_TPInterpolationND_large_grid_eval_latency_independent_of_coefficient_size():
+    # Guards against re-copying the full coefficient tensor on every evaluation:
+    # with a ~7.5M-element coefficient tensor a per-call flatten costs tens of
+    # milliseconds, while the evaluation itself only touches a 4^6 block.
+    rng = np.random.default_rng(42)
+    nodes = [np.sort(rng.uniform(0.0, 1.0, 12)) for _ in range(6)]
+    TPint = TPI.TP_Interpolant_ND(nodes)
+    coeffs = rng.standard_normal(tuple(len(node) + 2 for node in nodes))
+    TPint.SetSplineCoefficientsND(coeffs)
+
+    point = np.array([0.5 * (node[0] + node[-1]) for node in nodes], dtype=np.float64)
+    value = TPint.TPInterpolationND(point)
+    assert np.isfinite(value)
+
+    times_ms = []
+    for _ in range(20):
+        start = time.perf_counter()
+        TPint.TPInterpolationND(point)
+        times_ms.append((time.perf_counter() - start) * 1e3)
+    median_ms = float(np.median(times_ms))
+    print(f"6D eval with {coeffs.size} coefficients: median {median_ms:.3f} ms over 20 calls")
+    assert median_ms < 8.0
+
+
 def test_SplineMatrix():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12])
     b = TPI.BsplineBasis1D(x1)

@@ -128,7 +128,7 @@ cdef class TP_Interpolant_ND:
     cdef array* nodes_c
     cdef gsl_bspline_workspace **bw_array_ptrs
     cdef nodes, n
-    cdef c, knots_list
+    cdef c, c_flat, knots_list
 
     def __init__(self, list nodes, coeffs=None, F=None):
         """Constructor
@@ -201,7 +201,9 @@ cdef class TP_Interpolant_ND:
           * y: the interpolant evaluated at X, a float.
 
         """
-        cdef np.ndarray[np.double_t,ndim=1] c = self.c.flatten()
+        # self.c_flat is prepared when coefficients are set; flattening the full
+        # coefficient tensor here would copy it on every evaluation.
+        cdef np.ndarray[np.double_t,ndim=1] c = self.c_flat
         cdef double y;
         cdef int ret = TP_Interpolation_ND(<double*> c.data, len(c),
                         <double*> X.data, len(X), self.bw_array_ptrs, &y)
@@ -260,6 +262,8 @@ cdef class TP_Interpolant_ND:
         for minv in inv_1d_matrices[::-1]:
             tmp_result = np.tensordot(minv, tmp_result, (1, d - 1))
         self.c = tmp_result
+        # ravel() is a no-copy view here since tmp_result is a fresh contiguous array
+        self.c_flat = np.ascontiguousarray(tmp_result, dtype=np.double).ravel()
 
     def GetSplineCoefficientsND(self):
         return self.c
@@ -283,8 +287,11 @@ cdef class TP_Interpolant_ND:
 
         if not np.shape(coeffs) == tuple(dims):
             raise ValueError("Spline coefficients should have shape {}".format(dims))
-      
+
         self.c = coeffs
+        # For contiguous float64 input this is a no-copy view; otherwise the
+        # coefficients are converted once here instead of on every evaluation.
+        self.c_flat = np.ascontiguousarray(coeffs, dtype=np.double).ravel()
 
 
 cdef class BsplineBasis1D:
