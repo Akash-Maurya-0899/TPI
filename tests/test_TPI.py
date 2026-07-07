@@ -1352,6 +1352,54 @@ def test_jax_single_point_evaluator_grad_smoke_1d_2d_3d():
         assert np.all(np.isfinite(grads))
 
 
+def test_jax_TPInterpolationND_range_errors_and_endpoint_acceptance():
+    for dim, nodes, _, jax_interp in _single_chain_interpolant_cases():
+        lows = np.array([node[0] for node in nodes], dtype=np.float64)
+        highs = np.array([node[-1] for node in nodes], dtype=np.float64)
+
+        # exact endpoints must be accepted by both scalar and batched paths
+        endpoints = np.vstack([lows, highs])
+        for point in endpoints:
+            value = float(np.asarray(jax_interp.TPInterpolationND(point)))
+            assert np.isfinite(value)
+        batch_values = np.asarray(jax_interp.TPInterpolationND_batched(endpoints))
+        assert np.all(np.isfinite(batch_values))
+
+        # out-of-range on each axis must raise with the axis and bounds named
+        for axis in range(dim):
+            for bad_value, bound in ((lows[axis] - 0.5, lows[axis]), (highs[axis] + 0.5, highs[axis])):
+                bad_point = 0.5 * (lows + highs)
+                bad_point[axis] = bad_value
+                with pytest.raises(ValueError, match=f"X\\[{axis}\\]"):
+                    jax_interp.TPInterpolationND(bad_point)
+                bad_batch = np.vstack([0.5 * (lows + highs), bad_point])
+                with pytest.raises(ValueError, match=f"X\\[1, {axis}\\]"):
+                    jax_interp.TPInterpolationND_batched(bad_batch)
+
+        # shape errors are unchanged
+        with pytest.raises(ValueError):
+            jax_interp.TPInterpolationND(np.zeros(dim + 1))
+        with pytest.raises(ValueError):
+            jax_interp.TPInterpolationND_batched(np.zeros((2, dim + 1)))
+
+
+def test_jax_BsplineBasis1D_range_errors_and_endpoint_acceptance():
+    nodes = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    basis = TPI_jax.BsplineBasis1D(nodes)
+
+    for x in (nodes[0], nodes[-1], 0.16):
+        values = np.asarray(basis.EvaluateBsplines(x))
+        assert np.all(np.isfinite(values))
+        derivs = np.asarray(basis.EvaluateBsplines3rdDerivatives(x))
+        assert np.all(np.isfinite(derivs))
+
+    for x in (nodes[0] - 0.01, nodes[-1] + 0.01):
+        with pytest.raises(ValueError, match="outside of knots"):
+            basis.EvaluateBsplines(x)
+        with pytest.raises(ValueError, match="outside of knots"):
+            basis.EvaluateBsplines3rdDerivatives(x)
+
+
 def test_SplineMatrix():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12])
     b = TPI.BsplineBasis1D(x1)

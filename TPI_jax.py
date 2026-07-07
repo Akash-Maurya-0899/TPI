@@ -206,6 +206,10 @@ class BsplineBasis1D:
         self.xi = _as_valid_nodes(xvec_in)
         self.knots = _construct_knots_jax(self.xi)
         self.nbasis = int(self.knots.shape[0] - 4)
+        # Cached as Python floats: reading them per evaluation would force a
+        # device sync on every call.
+        self._x_min = float(np.asarray(self.xi[0]))
+        self._x_max = float(np.asarray(self.xi[-1]))
 
     def EvaluateBsplines(self, x):
         if isinstance(x, jax_core.Tracer):
@@ -216,12 +220,10 @@ class BsplineBasis1D:
             raise ValueError("Evaluation point x must be scalar.")
 
         x_val = float(x_arr)
-        x_min = float(np.asarray(self.xi[0]))
-        x_max = float(np.asarray(self.xi[-1]))
-        if x_val < x_min or x_val > x_max:
+        if x_val < self._x_min or x_val > self._x_max:
             raise ValueError(
                 f"Error: Bspline_basis_1D(): x: {x_val} is outside of knots "
-                f"vector with bounds [{x_min}, {x_max}]!"
+                f"vector with bounds [{self._x_min}, {self._x_max}]!"
             )
 
         return _evaluate_cubic_bspline_basis_jax(self.knots, x_val)
@@ -235,12 +237,10 @@ class BsplineBasis1D:
             raise ValueError("Evaluation point x must be scalar.")
 
         x_val = float(x_arr)
-        x_min = float(np.asarray(self.xi[0]))
-        x_max = float(np.asarray(self.xi[-1]))
-        if x_val < x_min or x_val > x_max:
+        if x_val < self._x_min or x_val > self._x_max:
             raise ValueError(
                 f"Error: Bspline_basis_3rd_derivative_1D(): x: {x_val} is outside of knots "
-                f"vector with bounds [{x_min}, {x_max}]!"
+                f"vector with bounds [{self._x_min}, {self._x_max}]!"
             )
 
         return _evaluate_cubic_bspline_3rd_derivatives_jax(self.knots, x_val)
@@ -362,6 +362,10 @@ class TP_Interpolant_ND:
         self.bases = tuple(BsplineBasis1D(np.asarray(node)) for node in self.nodes)
         self.knots_list = tuple(base.knots for base in self.bases)
         self.spline_matrix_factors = tuple(_factor_spline_matrix_jax(node) for node in self.nodes)
+        # Domain bounds cached host-side: reading node endpoints per evaluation
+        # would force a device sync on every call.
+        self._lows = np.array([base._x_min for base in self.bases], dtype=np.float64)
+        self._highs = np.array([base._x_max for base in self.bases], dtype=np.float64)
         self._jit_eval = self._build_evaluator()
 
     def _build_evaluator(self):
@@ -449,16 +453,15 @@ class TP_Interpolant_ND:
                 f"Expected X to be array of length {self.n}, but got length {X_arr.shape[0]}"
             )
 
-        for axis, node in enumerate(self.nodes):
-            x_min = float(np.asarray(node[0]))
-            x_max = float(np.asarray(node[-1]))
-            if X_arr[axis] < x_min or X_arr[axis] > x_max:
-                raise ValueError(
-                    f"TP_Interpolation_ND: X[{axis}] = {X_arr[axis]} is outside of "
-                    f"knots vector [{x_min}, {x_max}]!"
-                )
+        if np.any(X_arr < self._lows) or np.any(X_arr > self._highs):
+            for axis in range(self.n):
+                if X_arr[axis] < self._lows[axis] or X_arr[axis] > self._highs[axis]:
+                    raise ValueError(
+                        f"TP_Interpolation_ND: X[{axis}] = {X_arr[axis]} is outside of "
+                        f"knots vector [{self._lows[axis]}, {self._highs[axis]}]!"
+                    )
 
-        return self._jit_eval(self.c, jnp.asarray(X_arr, dtype=jnp.float64))
+        return self._jit_eval(self.c, X_arr)
 
     def _TPInterpolationND_jax(self, X):
         bases = []
@@ -487,15 +490,14 @@ class TP_Interpolant_ND:
                 f"Expected X to have shape (M, {self.n}), but got shape {X_arr.shape}"
             )
 
-        for row_index, point in enumerate(X_arr):
-            for axis, node in enumerate(self.nodes):
-                x_min = float(np.asarray(node[0]))
-                x_max = float(np.asarray(node[-1]))
-                if point[axis] < x_min or point[axis] > x_max:
-                    raise ValueError(
-                        f"TP_Interpolation_ND: X[{row_index}, {axis}] = {point[axis]} "
-                        f"is outside of knots vector [{x_min}, {x_max}]!"
-                    )
+        if np.any(X_arr < self._lows) or np.any(X_arr > self._highs):
+            for row_index, point in enumerate(X_arr):
+                for axis in range(self.n):
+                    if point[axis] < self._lows[axis] or point[axis] > self._highs[axis]:
+                        raise ValueError(
+                            f"TP_Interpolation_ND: X[{row_index}, {axis}] = {point[axis]} "
+                            f"is outside of knots vector [{self._lows[axis]}, {self._highs[axis]}]!"
+                        )
 
         return self._TPInterpolationND_batched_jax(jnp.asarray(X_arr, dtype=jnp.float64))
 
