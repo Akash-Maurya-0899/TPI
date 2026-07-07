@@ -92,43 +92,23 @@ def _find_active_cubic_bspline_span_jax(knots, x):
     return basis, span - 3
 
 
-def _find_active_cubic_bspline_span_jax_jit(knots, x):
-    """Gradient-friendly helper for the setup-built single-point JIT.
+def _pack_axis_eval_arrays(knots_list):
+    """Pack per-axis knot vectors into padded matrices for the single-point evaluator.
 
-    The span search is intentionally the same as _find_active_cubic_bspline_span_jax;
-    only the de Boor recurrence is written with static Python loops so jax.grad can
-    trace it. If the recurrence changes in one helper, the other must be checked too.
+    Axes may have different knot counts, so rows are padded with +inf. Padded
+    entries never affect the span search (inf <= x is always false for in-range x)
+    and are never gathered because the span is clipped per axis before indexing.
     """
-    knots = jnp.asarray(knots, dtype=jnp.float64)
-    x = jnp.asarray(x, dtype=jnp.float64)
-    span = jnp.searchsorted(knots[3:-3], x, side="right") + 2
-    span = jnp.clip(span, 3, knots.shape[0] - 5)
-
-    lefts = jnp.stack(
-        (
-            x - knots[span],
-            x - knots[span - 1],
-            x - knots[span - 2],
-        )
-    )
-    rights = jnp.stack(
-        (
-            knots[span + 1] - x,
-            knots[span + 2] - x,
-            knots[span + 3] - x,
-        )
-    )
-
-    basis = jnp.array((1.0, 0.0, 0.0, 0.0), dtype=jnp.float64)
-    for j in range(3):
-        saved = 0.0
-        for r in range(j + 1):
-            denom = rights[r] + lefts[j - r]
-            temp = jnp.where(denom != 0.0, basis[r] / denom, 0.0)
-            basis = basis.at[r].set(saved + rights[r] * temp)
-            saved = lefts[j - r] * temp
-        basis = basis.at[j + 1].set(saved)
-    return basis, span - 3
+    knots_np = [np.asarray(knots, dtype=np.float64) for knots in knots_list]
+    inner = [knots[3:-3] for knots in knots_np]
+    inner_pad = np.full((len(knots_np), max(len(v) for v in inner)), np.inf, dtype=np.float64)
+    for i, v in enumerate(inner):
+        inner_pad[i, : len(v)] = v
+    knots_pad = np.full((len(knots_np), max(len(k) for k in knots_np)), np.inf, dtype=np.float64)
+    for i, k in enumerate(knots_np):
+        knots_pad[i, : len(k)] = k
+    span_max = np.array([len(k) - 5 for k in knots_np], dtype=np.int64)
+    return jnp.asarray(inner_pad), jnp.asarray(knots_pad), jnp.asarray(span_max)
 
 
 def _evaluate_cubic_bspline_basis_jax(knots, x):
@@ -385,19 +365,56 @@ class TP_Interpolant_ND:
         self._jit_eval = self._build_evaluator()
 
     def _build_evaluator(self):
-        knots_list = self.knots_list
         n = self.n
+        inner_pad, knots_pad, span_max = _pack_axis_eval_arrays(self.knots_list)
+        offsets = jnp.arange(-2, 4, dtype=jnp.int64)
 
         def _evaluate(c, X):
-            bases = []
-            starts = []
-            for axis in range(n):
-                basis, start = _find_active_cubic_bspline_span_jax_jit(knots_list[axis], X[axis])
-                bases.append(basis)
-                starts.append(start)
+            # All axes are processed as one batched op chain. Keeping the traced
+            # graph a single dependency chain matters for single-point latency:
+            # independent per-axis subgraphs get scheduled across threads by the
+            # XLA CPU runtime, and the cross-thread synchronization dominates the
+            # actual arithmetic by an order of magnitude.
+            X = jnp.asarray(X, dtype=jnp.float64)
 
-            coeff_block = jax.lax.dynamic_slice(c, tuple(starts), (4,) * n)
-            return _contract_tensor_product_jax(bases, coeff_block)
+            # Vectorized span search over all axes; the count of inner knots <= x
+            # equals searchsorted(knots[3:-3], x, side="right") per axis.
+            count = jnp.sum(inner_pad <= X[:, None], axis=1)
+            span = jnp.clip(count + 2, 3, span_max)
+
+            # The 6 knots around each axis span, then the cubic de Boor recurrence
+            # unrolled on length-n vectors. 0/0 is guarded to 0 exactly as in
+            # _find_active_cubic_bspline_span_jax.
+            k = jnp.take_along_axis(knots_pad, span[:, None] + offsets[None, :], axis=1)
+            l1 = X - k[:, 2]
+            l2 = X - k[:, 1]
+            l3 = X - k[:, 0]
+            r1 = k[:, 3] - X
+            r2 = k[:, 4] - X
+            r3 = k[:, 5] - X
+
+            def _safe_div(num, den):
+                return jnp.where(den != 0.0, num / den, 0.0)
+
+            b0 = _safe_div(r1, r1 + l1)
+            b1 = _safe_div(l1, r1 + l1)
+            q0 = r1 * _safe_div(b0, r1 + l2)
+            q1 = l2 * _safe_div(b0, r1 + l2) + r2 * _safe_div(b1, r2 + l1)
+            q2 = l1 * _safe_div(b1, r2 + l1)
+            d0 = r1 * _safe_div(q0, r1 + l3)
+            d1 = l3 * _safe_div(q0, r1 + l3) + r2 * _safe_div(q1, r2 + l2)
+            d2 = l2 * _safe_div(q1, r2 + l2) + r3 * _safe_div(q2, r3 + l1)
+            d3 = l1 * _safe_div(q2, r3 + l1)
+            basis = jnp.stack((d0, d1, d2, d3), axis=1)
+
+            starts = span - 3
+            coeff_block = jax.lax.dynamic_slice(
+                c, tuple(starts[axis] for axis in range(n)), (4,) * n
+            )
+            result = coeff_block
+            for axis in range(n - 1, -1, -1):
+                result = jnp.sum(result * basis[axis], axis=-1)
+            return result
 
         return jax.jit(_evaluate)
 

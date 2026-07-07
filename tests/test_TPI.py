@@ -1216,6 +1216,142 @@ def test_jax_TPInterpolationND_batched_jit_smoke():
     assert np.allclose(jit_2, non_jit_2, atol=1e-10, rtol=0)
 
 
+def _single_chain_interpolant_cases():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    wi = np.array([-0.8, -0.6, -0.4, 0.0, 0.5, 1.0, 1.5])
+    functions = {
+        1: lambda x: np.cos(10.0 * x),
+        2: lambda x, y: np.sin(x) * np.arccos(y),
+        3: lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z),
+        4: lambda x, y, z, w: np.sin(x) * np.arccos(y) * np.exp(z) * np.cos(w),
+    }
+    node_sets = {1: (xi,), 2: (xi, yi), 3: (xi, yi, zi), 4: (xi, yi, zi, wi)}
+    cases = []
+    for dim, nodes in node_sets.items():
+        mesh = np.meshgrid(*nodes, indexing="ij")
+        F = np.asarray(functions[dim](*mesh), dtype=np.float64)
+        gsl_interp = TPI.TP_Interpolant_ND(list(nodes))
+        gsl_interp.ComputeSplineCoefficientsND(F)
+        jax_interp = TPI_jax.TP_Interpolant_ND(list(nodes))
+        jax_interp.ComputeSplineCoefficientsND(F)
+        cases.append((dim, nodes, gsl_interp, jax_interp))
+    return cases
+
+
+def _single_chain_interior_points(nodes, count=30):
+    rng = np.random.default_rng(42)
+    lows = np.array([node[0] for node in nodes], dtype=np.float64)
+    highs = np.array([node[-1] for node in nodes], dtype=np.float64)
+    return lows + rng.uniform(0.02, 0.98, size=(count, len(nodes))) * (highs - lows)
+
+
+def _print_max_diffs(diagnostics):
+    actual_flat = np.array([entry[2] for entry in diagnostics], dtype=np.float64)
+    expected_flat = np.array([entry[3] for entry in diagnostics], dtype=np.float64)
+    abs_diff = np.abs(actual_flat - expected_flat)
+    rel_den = np.maximum(np.abs(expected_flat), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    print(
+        f"max abs diff: {abs_diff[max_abs_idx]:.3e} "
+        f"at dim={diagnostics[max_abs_idx][0]} (x={diagnostics[max_abs_idx][1]})"
+    )
+    print(
+        f"max rel diff: {rel_diff[max_rel_idx]:.3e} "
+        f"at dim={diagnostics[max_rel_idx][0]} (x={diagnostics[max_rel_idx][1]})"
+    )
+    return actual_flat, expected_flat
+
+
+def test_jax_single_point_evaluator_matches_gsl_random_interior_points():
+    diagnostics = []
+    for dim, nodes, gsl_interp, jax_interp in _single_chain_interpolant_cases():
+        points = _single_chain_interior_points(nodes)
+        # warmup: trigger JIT compilation before assertions
+        jax_interp.TPInterpolationND(points[0])
+        jax_values = np.asarray(
+            jax.vmap(lambda p, interp=jax_interp: interp.TPInterpolationND(p))(
+                jax.numpy.asarray(points, dtype=jax.numpy.float64)
+            )
+        )
+        gsl_values = np.asarray(
+            [gsl_interp.TPInterpolationND(point) for point in points], dtype=np.float64
+        )
+        diagnostics.extend(
+            (dim, points[i], jax_values[i], gsl_values[i]) for i in range(points.shape[0])
+        )
+
+    jax_flat, gsl_flat = _print_max_diffs(diagnostics)
+    assert np.allclose(jax_flat, gsl_flat, atol=1e-10, rtol=0)
+
+
+def test_jax_single_point_evaluator_matches_legacy_per_axis_kernel():
+    diagnostics = []
+    for dim, nodes, _, jax_interp in _single_chain_interpolant_cases():
+        points = jax.numpy.asarray(_single_chain_interior_points(nodes), dtype=jax.numpy.float64)
+        # warmup: trigger JIT compilation before assertions
+        jax_interp.TPInterpolationND(np.asarray(points[0]))
+        new_values = np.asarray(
+            jax.vmap(lambda p, interp=jax_interp: interp.TPInterpolationND(p))(points)
+        )
+        legacy_values = np.asarray(jax.vmap(jax_interp._TPInterpolationND_jax)(points))
+        diagnostics.extend(
+            (dim, np.asarray(points[i]), new_values[i], legacy_values[i])
+            for i in range(points.shape[0])
+        )
+
+    new_flat, legacy_flat = _print_max_diffs(diagnostics)
+    assert np.allclose(new_flat, legacy_flat, atol=1e-13, rtol=0)
+
+
+def test_jax_single_point_evaluator_boundary_points_match_gsl():
+    diagnostics = []
+    for dim, nodes, gsl_interp, jax_interp in _single_chain_interpolant_cases():
+        lows = np.array([node[0] for node in nodes], dtype=np.float64)
+        highs = np.array([node[-1] for node in nodes], dtype=np.float64)
+        interior = [
+            np.array(
+                [nodes[axis][1 + (j + axis) % (len(nodes[axis]) - 2)] for axis in range(dim)],
+                dtype=np.float64,
+            )
+            for j in range(8)
+        ]
+        points = np.vstack([lows, highs] + interior)
+        # warmup: trigger JIT compilation before assertions
+        jax_interp.TPInterpolationND(points[0])
+        jax_values = np.asarray(
+            jax.vmap(lambda p, interp=jax_interp: interp.TPInterpolationND(p))(
+                jax.numpy.asarray(points, dtype=jax.numpy.float64)
+            )
+        )
+        gsl_values = np.asarray(
+            [gsl_interp.TPInterpolationND(point) for point in points], dtype=np.float64
+        )
+        diagnostics.extend(
+            (dim, points[i], jax_values[i], gsl_values[i]) for i in range(points.shape[0])
+        )
+
+    jax_flat, gsl_flat = _print_max_diffs(diagnostics)
+    assert np.allclose(jax_flat, gsl_flat, atol=1e-10, rtol=0)
+
+
+def test_jax_single_point_evaluator_grad_smoke_1d_2d_3d():
+    for dim, nodes, _, jax_interp in _single_chain_interpolant_cases():
+        if dim > 3:
+            continue
+        points = jax.numpy.asarray(
+            _single_chain_interior_points(nodes, count=3), dtype=jax.numpy.float64
+        )
+        grad_fn = jax.vmap(jax.grad(lambda p, interp=jax_interp: interp.TPInterpolationND(p)))
+        grads = np.asarray(grad_fn(points))
+        print(f"dim={dim} grads:\n{grads}")
+        assert grads.shape == (3, dim)
+        assert np.all(np.isfinite(grads))
+
+
 def test_SplineMatrix():
     x1 = np.array([1.1, 3.2, 5.1, 7.2, 9.3, 12])
     b = TPI.BsplineBasis1D(x1)
