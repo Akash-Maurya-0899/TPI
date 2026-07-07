@@ -1552,6 +1552,78 @@ def test_jax_vector_valued_shape_errors():
         interp.SetSplineCoefficientsND(np.zeros(tuple(len(node) + 2 for node in nodes)))
 
 
+def test_jax_batched_public_path_is_jit_cached_and_tracks_coefficients():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    nodes = [xi, yi, zi]
+    rng = np.random.default_rng(42)
+    coeff_shape = tuple(len(node) + 2 for node in nodes)
+    coeffs_a = rng.standard_normal(coeff_shape)
+    coeffs_b = rng.standard_normal(coeff_shape)
+
+    TPint = TPI_jax.TP_Interpolant_ND(nodes)
+    TPint.SetSplineCoefficientsND(coeffs_a)
+
+    lows = np.array([node[0] for node in nodes])
+    highs = np.array([node[-1] for node in nodes])
+    points = lows + rng.uniform(0.05, 0.95, size=(64, 3)) * (highs - lows)
+
+    # warmup: trigger JIT compilation before assertions
+    np.asarray(TPint.TPInterpolationND_batched(points))
+
+    times_ms = []
+    for _ in range(10):
+        start = time.perf_counter()
+        result = TPint.TPInterpolationND_batched(points)
+        jax.block_until_ready(result)
+        times_ms.append((time.perf_counter() - start) * 1e3)
+    median_ms = float(np.median(times_ms))
+    print(f"public batched call median: {median_ms:.3f} ms over 10 calls (64 points)")
+    # A retrace on every call costs hundreds of ms; a cached call is well under 20.
+    assert median_ms < 20.0
+
+    values_a = np.asarray(TPint.TPInterpolationND_batched(points))
+    TPint.SetSplineCoefficientsND(coeffs_b)
+    values_b = np.asarray(TPint.TPInterpolationND_batched(points))
+    scalar_b = np.array(
+        [float(np.asarray(TPint.TPInterpolationND(point))) for point in points]
+    )
+    max_abs = float(np.max(np.abs(values_b - scalar_b)))
+    print(f"batched-vs-scalar after coefficient swap max abs diff: {max_abs:.3e}")
+    assert not np.allclose(values_a, values_b, atol=1e-12, rtol=0)
+    assert np.allclose(values_b, scalar_b, atol=1e-14, rtol=0)
+
+
+def test_jax_construction_reuses_compiled_setup_across_instances():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    nodes = [xi, yi, zi]
+    f = lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z)
+    xx, yy, zz = np.meshgrid(xi, yi, zi, indexing="ij")
+    F = f(xx, yy, zz)
+
+    # warmup: first construction compiles the setup path for these grid shapes
+    reference = TPI_jax.TP_Interpolant_ND(nodes, F=F)
+
+    times_ms = []
+    values = []
+    point = np.array([0.1692602, 0.2827312351474, -0.26624193])
+    for _ in range(3):
+        start = time.perf_counter()
+        TPint = TPI_jax.TP_Interpolant_ND(nodes, F=F)
+        times_ms.append((time.perf_counter() - start) * 1e3)
+        values.append(float(np.asarray(TPint.TPInterpolationND(point))))
+    median_ms = float(np.median(times_ms))
+    print(f"repeat construction median: {median_ms:.3f} ms over 3 constructions")
+    # Retracing the spline-matrix assembly costs hundreds of ms per construction.
+    assert median_ms < 150.0
+
+    expected = float(np.asarray(reference.TPInterpolationND(point)))
+    assert np.allclose(values, expected, atol=1e-14, rtol=0)
+
+
 def test_SetSplineCoefficientsND_roundtrip_interpolation_matches_compute():
     for dim, nodes, gsl_interp, _ in _single_chain_interpolant_cases():
         points = _single_chain_interior_points(nodes, count=10)

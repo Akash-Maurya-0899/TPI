@@ -256,8 +256,13 @@ def construct_knots(nodes):
     return _construct_knots_jax(nodes_array)
 
 
+@jax.jit
 def _assemble_spline_matrix_jax(nodes):
-    """Assemble the cubic spline matrix for a validated 1D node array."""
+    """Assemble the cubic spline matrix for a validated 1D node array.
+
+    jit-compiled so repeated construction on grids with the same axis lengths
+    reuses the compiled assembly instead of retracing it per instance.
+    """
     knots = _construct_knots_jax(nodes)
     phi_internal = jax.vmap(lambda x: _evaluate_cubic_bspline_basis_jax(knots, x))(nodes)
 
@@ -279,8 +284,13 @@ def _assemble_spline_matrix_jax(nodes):
     return phi, knots
 
 
+@jax.jit
 def _factor_spline_matrix_jax(nodes):
-    """Factor the cubic spline matrix for a validated 1D node array."""
+    """Factor the cubic spline matrix for a validated 1D node array.
+
+    jit-compiled for the same reason as _assemble_spline_matrix_jax: setup on
+    a previously seen axis length is a compilation-cache hit.
+    """
     phi, _ = _assemble_spline_matrix_jax(nodes)
     return jax_linalg.lu_factor(phi)
 
@@ -386,6 +396,11 @@ class TP_Interpolant_ND:
         self._lows = np.array([base._x_min for base in self.bases], dtype=np.float64)
         self._highs = np.array([base._x_max for base in self.bases], dtype=np.float64)
         self._jit_eval = self._build_evaluator()
+        # Batched evaluator, jit-cached once here: vmapping on every call would
+        # retrace the kernel per batch (hundreds of ms). Coefficients are an
+        # explicit argument so SetSplineCoefficientsND updates take effect
+        # without recompilation.
+        self._jit_eval_batched = jax.jit(jax.vmap(self._eval_pointwise, in_axes=(None, 0)))
 
     def _build_evaluator(self):
         n = self.n
@@ -496,7 +511,8 @@ class TP_Interpolant_ND:
 
         return self._jit_eval(self.c, X_arr)
 
-    def _TPInterpolationND_jax(self, X):
+    def _eval_pointwise(self, c, X):
+        """Per-axis evaluation kernel with coefficients as an explicit argument."""
         bases = []
         starts = []
         for axis in range(self.n):
@@ -507,13 +523,16 @@ class TP_Interpolant_ND:
         if self._values_shape:
             zero = jnp.zeros((), dtype=starts[0].dtype)
             coeff_block = jax.lax.dynamic_slice(
-                self.c,
+                c,
                 tuple(starts) + (zero,) * len(self._values_shape),
                 (4,) * self.n + self._values_shape,
             )
             return _contract_tensor_product_values_jax(bases, coeff_block, self._values_shape)
-        coeff_block = jax.lax.dynamic_slice(self.c, tuple(starts), (4,) * self.n)
+        coeff_block = jax.lax.dynamic_slice(c, tuple(starts), (4,) * self.n)
         return _contract_tensor_product_jax(bases, coeff_block)
+
+    def _TPInterpolationND_jax(self, X):
+        return self._eval_pointwise(self.c, X)
 
     def TPInterpolationND_batched(self, X):
         if self.c is None:
@@ -543,7 +562,7 @@ class TP_Interpolant_ND:
         return self._TPInterpolationND_batched_jax(jnp.asarray(X_arr, dtype=jnp.float64))
 
     def _TPInterpolationND_batched_jax(self, X):
-        return jax.vmap(self._TPInterpolationND_jax)(X)
+        return self._jit_eval_batched(self.c, X)
 
     def __call__(self, X):
         X_arr = np.atleast_1d(np.asarray(X, dtype=np.float64))
