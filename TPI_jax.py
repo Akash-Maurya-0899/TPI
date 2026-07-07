@@ -301,21 +301,26 @@ def _solve_axis_system_from_lu(lu_and_piv, tensor, axis):
     return jnp.moveaxis(solved, 0, axis)
 
 
-def _compute_spline_coefficients_nd(nodes, F, spline_matrix_factors=None):
+def _compute_spline_coefficients_nd(nodes, F, spline_matrix_factors=None, values_shape=()):
     """Compute tensor-product spline coefficients for validated nodes and data.
 
     The implementation performs sequential 1D solves along each axis. On grids with
     high spline-matrix condition numbers, tiny differences in assembled matrices or
     floating-point ordering can be amplified into larger coefficient differences.
+
+    For vector/tensor-valued data, F carries trailing value axes of shape
+    values_shape. The 1D solves only run over the grid axes; value axes ride
+    along as extra right-hand sides.
     """
     nodes = tuple(jnp.asarray(node, dtype=jnp.float64) for node in nodes)
     F = jnp.asarray(F, dtype=jnp.float64)
+    values_shape = tuple(values_shape)
 
     dims = tuple(int(node.shape[0]) for node in nodes)
-    if F.shape != dims:
-        raise ValueError(f"Data on TP grid should have shape {list(dims)}")
+    if F.shape != dims + values_shape:
+        raise ValueError(f"Data on TP grid should have shape {list(dims + values_shape)}")
 
-    coeffs = jnp.pad(F, [(1, 1)] * len(nodes), mode="constant")
+    coeffs = jnp.pad(F, [(1, 1)] * len(nodes) + [(0, 0)] * len(values_shape), mode="constant")
     if spline_matrix_factors is None:
         spline_matrix_factors = tuple(_factor_spline_matrix_jax(node) for node in nodes)
     for axis in range(len(nodes) - 1, -1, -1):
@@ -334,6 +339,15 @@ def _contract_tensor_product_jax(bases, coeff_block):
     return result
 
 
+def _contract_tensor_product_values_jax(bases, coeff_block, values_shape):
+    """Contract the grid axes of a (4,)*n + values_shape block, keeping value axes."""
+    n = len(bases)
+    result = coeff_block.reshape((4,) * n + (-1,))
+    for basis in reversed(bases):
+        result = jnp.sum(result * basis[:, None], axis=-2)
+    return result.reshape(values_shape)
+
+
 class TP_Interpolant_ND:
     """JAX-side tensor-product spline interpolant helper."""
 
@@ -344,6 +358,11 @@ class TP_Interpolant_ND:
             raise TypeError("Expected list of numpy.ndarrays.")
         if not np.array(list(map(lambda x: isinstance(x, np.ndarray), nodes))).all():
             raise TypeError("Expected list of numpy.ndarrays.")
+
+        # Scalar-valued by default; TP_Interpolant_ND_Vector sets _values_shape
+        # before delegating here.
+        if not hasattr(self, "_values_shape"):
+            self._values_shape = ()
 
         self.nodes = tuple(_as_valid_nodes(node) for node in nodes)
         self.n = len(self.nodes)
@@ -370,6 +389,7 @@ class TP_Interpolant_ND:
 
     def _build_evaluator(self):
         n = self.n
+        values_shape = self._values_shape
         inner_pad, knots_pad, span_max = _pack_axis_eval_arrays(self.knots_list)
         offsets = jnp.arange(-2, 4, dtype=jnp.int64)
 
@@ -412,6 +432,17 @@ class TP_Interpolant_ND:
             basis = jnp.stack((d0, d1, d2, d3), axis=1)
 
             starts = span - 3
+            if values_shape:
+                zero = jnp.zeros((), dtype=starts.dtype)
+                coeff_block = jax.lax.dynamic_slice(
+                    c,
+                    tuple(starts[axis] for axis in range(n)) + (zero,) * len(values_shape),
+                    (4,) * n + values_shape,
+                )
+                result = coeff_block.reshape((4,) * n + (-1,))
+                for axis in range(n - 1, -1, -1):
+                    result = jnp.sum(result * basis[axis][:, None], axis=-2)
+                return result.reshape(values_shape)
             coeff_block = jax.lax.dynamic_slice(
                 c, tuple(starts[axis] for axis in range(n)), (4,) * n
             )
@@ -423,7 +454,9 @@ class TP_Interpolant_ND:
         return jax.jit(_evaluate)
 
     def ComputeSplineCoefficientsND(self, F):
-        coeffs = _compute_spline_coefficients_nd(self.nodes, F, self.spline_matrix_factors)
+        coeffs = _compute_spline_coefficients_nd(
+            self.nodes, F, self.spline_matrix_factors, values_shape=self._values_shape
+        )
         self.c = coeffs
         return coeffs
 
@@ -431,7 +464,7 @@ class TP_Interpolant_ND:
         return self.c
 
     def SetSplineCoefficientsND(self, coeffs):
-        dims = tuple(len(node) + 2 for node in self.nodes)
+        dims = tuple(len(node) + 2 for node in self.nodes) + self._values_shape
         coeffs = jnp.asarray(coeffs, dtype=jnp.float64)
         if coeffs.shape != dims:
             raise ValueError(f"Spline coefficients should have shape {list(dims)}")
@@ -471,6 +504,14 @@ class TP_Interpolant_ND:
             bases.append(basis)
             starts.append(start)
 
+        if self._values_shape:
+            zero = jnp.zeros((), dtype=starts[0].dtype)
+            coeff_block = jax.lax.dynamic_slice(
+                self.c,
+                tuple(starts) + (zero,) * len(self._values_shape),
+                (4,) * self.n + self._values_shape,
+            )
+            return _contract_tensor_product_values_jax(bases, coeff_block, self._values_shape)
         coeff_block = jax.lax.dynamic_slice(self.c, tuple(starts), (4,) * self.n)
         return _contract_tensor_product_jax(bases, coeff_block)
 
@@ -513,3 +554,76 @@ class TP_Interpolant_ND:
                 f"Expected X to be array of length {self.n}, but got length {X_arr.shape[0]}"
             )
         return self.TPInterpolationND(X_arr)
+
+
+class TP_Interpolant_ND_Vector(TP_Interpolant_ND):
+    """Tensor-product spline interpolant for vector/tensor-valued data.
+
+    Behaves like TP_Interpolant_ND, except grid data F carries trailing value
+    axes of shape values_shape and evaluation returns arrays of that shape.
+    All components share the grid, knot vectors, and LU-factored spline
+    matrices; the coefficient solve and the compiled evaluator are batched
+    over the value axes, so interpolating an M-component field costs far less
+    than M scalar interpolants.
+
+    Shapes:
+      * F passed to ComputeSplineCoefficientsND: grid dims + values_shape
+      * coefficients: tuple(len(nodes_i) + 2) + values_shape
+      * TPInterpolationND(X): values_shape
+      * TPInterpolationND_batched(X) with X of shape (M, n): (M,) + values_shape
+    """
+
+    def __init__(self, nodes, values_shape, coeffs=None, F=None):
+        try:
+            shape_tuple = tuple(int(s) for s in np.atleast_1d(values_shape))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("values_shape must be a shape of positive integers.") from exc
+        if len(shape_tuple) == 0 or any(s < 1 for s in shape_tuple):
+            raise ValueError("values_shape must be a shape of positive integers.")
+        self._values_shape = shape_tuple
+        super().__init__(nodes, coeffs=coeffs, F=F)
+
+    @classmethod
+    def FromComponentSplines(cls, nodes, components, values_shape=None):
+        """Combine per-component splines sharing one grid into one vector-valued spline.
+
+        Arguments:
+          * nodes: list of 1D node arrays, as for the constructor. Every
+            component must have been built on exactly these nodes.
+          * components: list whose entries are either per-component spline
+            coefficient arrays of shape tuple(len(nodes_i) + 2), or objects
+            exposing GetSplineCoefficientsND() (TPI or TPI_jax interpolants).
+          * values_shape: optional shape for the value axes; defaults to
+            (len(components),). Its product must equal len(components); the
+            components fill the value axes in C (row-major) order.
+
+        Returns a TP_Interpolant_ND_Vector with the stacked coefficients set.
+        """
+        coeff_arrays = []
+        for component in components:
+            if hasattr(component, "GetSplineCoefficientsND"):
+                component = component.GetSplineCoefficientsND()
+            coeff_arrays.append(np.asarray(component, dtype=np.float64))
+        if not coeff_arrays:
+            raise ValueError("Expected at least one component spline.")
+
+        expected = tuple(len(np.asarray(node)) + 2 for node in nodes)
+        for index, coeff in enumerate(coeff_arrays):
+            if coeff.shape != expected:
+                raise ValueError(
+                    f"Component {index} coefficients have shape {list(coeff.shape)}, "
+                    f"expected {list(expected)}; all components must share the same nodes."
+                )
+
+        stacked = np.stack(coeff_arrays, axis=-1)
+        if values_shape is None:
+            values_shape = (len(coeff_arrays),)
+        else:
+            values_shape = tuple(int(s) for s in np.atleast_1d(values_shape))
+            if int(np.prod(values_shape)) != len(coeff_arrays):
+                raise ValueError(
+                    f"values_shape {list(values_shape)} does not hold "
+                    f"{len(coeff_arrays)} components."
+                )
+            stacked = stacked.reshape(expected + values_shape)
+        return cls(nodes, values_shape, coeffs=stacked)
