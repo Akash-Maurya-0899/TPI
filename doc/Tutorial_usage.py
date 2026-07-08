@@ -198,17 +198,25 @@ except ValueError as exc:
     print("out of range ->", exc)
 
 # %% [markdown]
-# ### 3.2 Batches of points — and what `vmap` means
+# ### 3.2 Batches of points
 #
-# Suppose you have M points stored as an `(M, N)` array. With the Cython
-# backend you loop in Python, paying the Python interpreter once per point.
+# Suppose you have M points stored as an `(M, N)` array. **Both backends**
+# provide `TPInterpolationND_batched`, which evaluates all M points in one
+# call. `__call__` dispatches on the input shape, so `fI(points)` with an
+# `(M, N)` array does the same thing. If any point is out of range, a
+# `ValueError` names the offending point and axis — and nothing is evaluated.
 #
-# The JAX backend instead offers `TPInterpolationND_batched`, built with
-# **`jax.vmap`** ("vectorizing map"): JAX takes the *single-point* evaluation
-# code and mechanically transforms it into a program that processes the whole
-# batch in one call — same math, but the per-call bookkeeping is paid once per
-# *batch* rather than once per *point*. You never write the loop, and there is
-# no per-point Python overhead.
+# Under the hood the two backends get there differently:
+#
+#  * **Cython/GSL** runs the per-point C evaluation in a single C loop. The
+#    workspace setup and the Python-call overhead are paid once per *batch*
+#    instead of once per *point*, and the GIL is released while the loop runs,
+#    so other Python threads can make progress.
+#  * **JAX** uses **`jax.vmap`** ("vectorizing map"): JAX takes the
+#    *single-point* evaluation code and mechanically transforms it into a
+#    program that processes the whole batch in one compiled call — same math,
+#    but vectorized across points. You never write the loop, and there is no
+#    per-point Python overhead.
 
 # %%
 rng = np.random.default_rng(42)
@@ -216,14 +224,17 @@ lows = np.array([n[0] for n in nodes])
 highs = np.array([n[-1] for n in nodes])
 points_batch = lows + rng.uniform(0.05, 0.95, size=(512, 3)) * (highs - lows)
 
-# Cython: a Python loop is the only option
-values_gsl = np.array([fI_gsl.TPInterpolationND(p) for p in points_batch])
-
-# JAX: one vectorized call
-values_jax = np.asarray(fI_jax.TPInterpolationND_batched(points_batch))
+values_gsl = fI_gsl.TPInterpolationND_batched(points_batch)              # one C loop
+values_jax = np.asarray(fI_jax.TPInterpolationND_batched(points_batch))  # one vmap call
 
 print("batch shapes:", values_gsl.shape, values_jax.shape)
 print("max |GSL - JAX| over 512 points:", np.max(np.abs(values_gsl - values_jax)))
+print("__call__ dispatches on shape:", np.array_equal(fI_gsl(points_batch), values_gsl))
+
+try:
+    fI_gsl.TPInterpolationND_batched(np.array([[0.16, 0.0, 0.0], [0.5, 0.0, 0.0]]))
+except ValueError as exc:
+    print("out of range ->", exc)  # names point 1, axis 0 (x outside [0.1, 0.25])
 
 # %% [markdown]
 # ### 3.3 `jit`: where the JAX backend actually shines
@@ -510,19 +521,37 @@ print(f"  JAX per point inside jit  {jax_per_point_in_jit*1e3:9.2f} us   (from 5
 #
 # ### 5.3 Batched evaluation
 #
-# **What this measures:** total time to evaluate the same 512 points, either
-# looping in Python over the Cython backend (per-point overhead × 512) or as
-# one vectorized JAX call (per-batch overhead × 1).
+# **What this measures:** total time to evaluate the same 512 points three
+# ways — looping in Python over the Cython backend (per-point overhead × 512),
+# the Cython backend's batched call (one C loop, overhead paid once), and the
+# vectorized JAX call.
 
 # %%
-gsl_batch = median_ms(
+gsl_loop = median_ms(
     lambda pts: np.array([fI_gsl.TPInterpolationND(p) for p in pts]), points_batch, repeat=20
 )
+gsl_batch = median_ms(fI_gsl.TPInterpolationND_batched, points_batch, repeat=50)
 print(f"512-point batch, 3D:")
-print(f"  GSL python loop           {gsl_batch:9.3f} ms  ({gsl_batch/512*1e3:6.2f} us/point)")
+print(f"  GSL python loop           {gsl_loop:9.3f} ms  ({gsl_loop/512*1e3:6.2f} us/point)")
+print(f"  GSL batched               {gsl_batch:9.3f} ms  ({gsl_batch/512*1e3:6.2f} us/point)")
 print(f"  JAX warmup                {batch_warmup:9.3f} ms   (cache hit; see note above)")
 print(f"  JAX vmap batch            {jax_batch:9.3f} ms  ({jax_batch/512*1e3:6.2f} us/point)")
-print(f"  speedup (steady)          {gsl_batch/jax_batch:9.1f}x")
+print(f"  GSL batched vs loop       {gsl_loop/gsl_batch:9.1f}x")
+print(f"  accuracy: max |GSL batched - JAX batch| = "
+      f"{np.max(np.abs(np.asarray(fI_gsl.TPInterpolationND_batched(points_batch)) - np.asarray(fI_jax.TPInterpolationND_batched(points_batch)))):.2e}")
+
+# %% [markdown]
+# **How to read this:** never loop over points in Python — the batched GSL
+# call does bit-for-bit the same arithmetic with the Python overhead and the
+# per-call workspace allocations paid once per batch. That overhead is a
+# fixed cost per point, so the gain is largest where the actual evaluation is
+# cheapest: roughly 5x in 1D, shrinking towards ~1.3x by 4D where the 4^N
+# coefficient contraction dominates. Between the two batched paths the winner
+# depends on dimension, grid size, and batch size: the GSL loop has
+# essentially zero fixed cost and wins small batches outright, while the
+# compiled JAX kernel vectorizes *across* points and pulls ahead for large
+# batches in higher dimensions. Both agree to ~1e-14, so from plain Python
+# simply use the batched call of whichever backend you already hold.
 
 # %% [markdown]
 # ### 5.4 Gradients
@@ -608,13 +637,30 @@ print(f"  100 scalar evals          {gsl_scalar_x100*1e3:9.2f} us")
 print(f"  speedup                   {gsl_scalar_x100/gsl_vec100:9.1f}x")
 
 # %% [markdown]
+# Vector-valued splines batch too — `TPInterpolationND_batched` returns
+# `(M,) + values_shape`, sharing the span search across components *and* the
+# setup across points:
+
+# %%
+gsl_vec_batch = median_ms(fI_vec_gsl.TPInterpolationND_batched, points_batch, repeat=50)
+vec_batch_warmup = once_ms(fI_vec.TPInterpolationND_batched, points_batch)
+jax_vec_batch = median_ms(fI_vec.TPInterpolationND_batched, points_batch, repeat=50)
+print("3-component vector spline, 512-point batch:")
+print(f"  GSL batched               {gsl_vec_batch:9.3f} ms  -> shape {np.asarray(fI_vec_gsl.TPInterpolationND_batched(points_batch)).shape}")
+print(f"  JAX warmup                {vec_batch_warmup:9.3f} ms")
+print(f"  JAX vmap batch            {jax_vec_batch:9.3f} ms")
+
+# %% [markdown]
 # ### 5.6 Takeaways
 #
 #  * **Construction** costs are comparable; both are one-time costs.
 #  * **One-at-a-time Python calls:** Cython/GSL is the right tool
 #    (microseconds vs tens of microseconds).
-#  * **Batches:** JAX's `vmap` path wins as soon as you have more than a
-#    handful of points, and the gap grows with batch size.
+#  * **Batches:** never loop over points in Python — both backends provide
+#    `TPInterpolationND_batched` (also reachable as `fI(points)`). The GSL
+#    batch is a single GIL-releasing C loop and wins small-to-medium batches;
+#    the JAX kernel vectorizes across points and pulls ahead for large
+#    batches in higher dimensions.
 #  * **Inside a JAX model:** embedding the interpolant in jitted code makes
 #    its per-point cost sub-microsecond and gives you exact gradients for
 #    free — this is the setting the JAX backend was built for.
@@ -640,7 +686,8 @@ print(f"  speedup                   {gsl_scalar_x100/gsl_vec100:9.1f}x")
 #
 # # --- evaluate ---
 # y  = fI(x)                                      # single point
-# ys = fI.TPInterpolationND_batched(xs)           # (M, N) -> (M,)   [JAX]
+# ys = fI.TPInterpolationND_batched(xs)           # (M, N) -> (M,)   [both backends]
+# ys = fI(xs)                                     # same, __call__ dispatches on shape
 # g  = jax.grad(fI.TPInterpolationND)(x)          # dI/dx            [JAX]
 # ys = jax.vmap(fI.TPInterpolationND)(xs)         # inside your own jit/vmap
 #

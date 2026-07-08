@@ -335,13 +335,24 @@ def benchmark_case(case: Case):
 
     print("Batched evaluation")
     batch_reps = _batch_repeat_counts(case.dim)
-    cython_batch_ms, cython_batch_result = _time_repeat(
+    cython_loop_ms, cython_loop_result = _time_repeat(
         lambda pts: np.array([float(np.asarray(cython.TPInterpolationND(pt))) for pt in pts], dtype=np.float64),
         batch_reps,
         case.batch_points,
     )
+    cython_loop_values = np.asarray(cython_loop_result, dtype=np.float64)
+    print(f"  GSL/Cython loop    steady-state  {_format_ms(cython_loop_ms / batch_reps)}")
+
+    cython_batch_ms, cython_batch_result = _time_repeat(
+        cython.TPInterpolationND_batched,
+        batch_reps,
+        case.batch_points,
+    )
     cython_batch_values = np.asarray(cython_batch_result, dtype=np.float64)
-    print(f"  GSL/Cython         steady-state  {_format_ms(cython_batch_ms / batch_reps)}")
+    print(
+        f"  GSL/Cython batched steady-state  {_format_ms(cython_batch_ms / batch_reps)} "
+        f"({(cython_loop_ms / cython_batch_ms):.2f}x speedup vs loop)"
+    )
 
     jax_batched_jit = jax.jit(jax_interp.TPInterpolationND_batched)
     jax_batch_warmup_ms, _ = _time_once(jax_batched_jit, case.batch_points)
@@ -350,8 +361,9 @@ def benchmark_case(case: Case):
     print(f"  JAX                JIT warmup    {_format_ms(jax_batch_warmup_ms)}")
     print(
         f"  JAX                steady-state  {_format_ms(jax_batch_steady_ms / batch_reps)} "
-        f"({(cython_batch_ms / jax_batch_steady_ms):.2f}x speedup vs GSL)"
+        f"({(cython_batch_ms / jax_batch_steady_ms):.2f}x speedup vs GSL batched)"
     )
+    print(f"  loop vs batched GSL max abs diff  {np.max(np.abs(cython_batch_values - cython_loop_values)):.3e}")
     print(f"  batch max abs diff  {np.max(np.abs(jax_batch_values - cython_batch_values)):.3e}")
 
     print("Repeated evaluations with different coefficient tensors")
