@@ -1552,6 +1552,223 @@ def test_jax_vector_valued_shape_errors():
         interp.SetSplineCoefficientsND(np.zeros(tuple(len(node) + 2 for node in nodes)))
 
 
+def _vector_case_3d():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    nodes = (xi, yi, zi)
+    component_functions = (
+        lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z),
+        lambda x, y, z: np.cos(10.0 * x) * y * z,
+        lambda x, y, z: x * y + z * z,
+    )
+    xx, yy, zz = np.meshgrid(xi, yi, zi, indexing="ij")
+    F = np.stack([fn(xx, yy, zz) for fn in component_functions], axis=-1)
+    return nodes, component_functions, F
+
+
+def test_gsl_vector_valued_interpolation_matches_per_component():
+    for case in (_vector_case_2d(), _vector_case_3d()):
+        nodes, component_functions, F = case
+        ncomp = F.shape[-1]
+        dim = len(nodes)
+
+        vector_interp = TPI.TP_Interpolant_ND_Vector(list(nodes), values_shape=(ncomp,))
+        coeffs = np.asarray(vector_interp.ComputeSplineCoefficientsND(F))
+        assert coeffs.shape == tuple(len(node) + 2 for node in nodes) + (ncomp,)
+
+        scalar_interps = []
+        for comp in range(ncomp):
+            scalar_interp = TPI.TP_Interpolant_ND(list(nodes))
+            scalar_interp.ComputeSplineCoefficientsND(np.ascontiguousarray(F[..., comp]))
+            scalar_interps.append(scalar_interp)
+            comp_coeff_diff = float(
+                np.max(np.abs(coeffs[..., comp] - np.asarray(scalar_interp.GetSplineCoefficientsND())))
+            )
+            print(f"{dim}D component {comp} coefficient max abs diff vs scalar GSL: {comp_coeff_diff:.3e}")
+            assert comp_coeff_diff < 1e-13
+
+        points = _single_chain_interior_points(nodes)
+        vector_values = np.stack([np.asarray(vector_interp.TPInterpolationND(p)) for p in points])
+        assert vector_values.shape == (points.shape[0], ncomp)
+        scalar_values = np.stack(
+            [
+                np.asarray([scalar_interps[comp].TPInterpolationND(point) for point in points])
+                for comp in range(ncomp)
+            ],
+            axis=-1,
+        )
+        abs_diff = np.abs(vector_values - scalar_values)
+        idx = np.unravel_index(np.argmax(abs_diff), abs_diff.shape)
+        rel_diff = abs_diff / np.maximum(np.abs(scalar_values), np.finfo(np.float64).tiny)
+        ridx = np.unravel_index(np.argmax(rel_diff), rel_diff.shape)
+        print(f"{dim}D max abs diff: {abs_diff[idx]:.3e} at point={points[idx[0]]}, component={idx[1]}")
+        print(f"{dim}D max rel diff: {rel_diff[ridx]:.3e} at point={points[ridx[0]]}, component={ridx[1]}")
+        assert np.allclose(vector_values, scalar_values, atol=1e-14, rtol=0)
+
+
+def test_gsl_vector_valued_interpolation_matches_jax_vector():
+    nodes, component_functions, F = _vector_case_3d()
+    ncomp = F.shape[-1]
+
+    gsl_interp = TPI.TP_Interpolant_ND_Vector(list(nodes), values_shape=(ncomp,), F=F)
+    jax_interp = TPI_jax.TP_Interpolant_ND_Vector(list(nodes), values_shape=(ncomp,), F=F)
+
+    points = _single_chain_interior_points(nodes)
+    # warmup: trigger JIT compilation before assertions
+    jax_interp.TPInterpolationND(points[0])
+    gsl_values = np.stack([np.asarray(gsl_interp.TPInterpolationND(p)) for p in points])
+    jax_values = np.asarray(jax_interp.TPInterpolationND_batched(points))
+    abs_diff = np.abs(gsl_values - jax_values)
+    idx = np.unravel_index(np.argmax(abs_diff), abs_diff.shape)
+    rel_diff = abs_diff / np.maximum(np.abs(jax_values), np.finfo(np.float64).tiny)
+    ridx = np.unravel_index(np.argmax(rel_diff), rel_diff.shape)
+    print(f"max abs diff: {abs_diff[idx]:.3e} at point={points[idx[0]]}, component={idx[1]}")
+    print(f"max rel diff: {rel_diff[ridx]:.3e} at point={points[ridx[0]]}, component={ridx[1]}")
+    assert np.allclose(gsl_values, jax_values, atol=1e-10, rtol=0)
+
+
+def test_gsl_tensor_valued_interpolation_shapes_and_call():
+    nodes, component_functions, F = _vector_case_2d()
+    F_tensor = np.concatenate([F, 2.0 * F], axis=-1).reshape(F.shape[:-1] + (2, 3))
+
+    tensor_interp = TPI.TP_Interpolant_ND_Vector(list(nodes), values_shape=(2, 3), F=F_tensor)
+    coeffs = np.asarray(tensor_interp.GetSplineCoefficientsND())
+    assert coeffs.shape == tuple(len(node) + 2 for node in nodes) + (2, 3)
+
+    point = np.array([0.16, 0.28])
+    single = np.asarray(tensor_interp.TPInterpolationND(point))
+    assert single.shape == (2, 3)
+    called = np.asarray(tensor_interp(point))
+    assert np.allclose(called, single, atol=0, rtol=0)
+
+    # first three components duplicate the vector case, last three are scaled
+    max_abs = float(np.max(np.abs(single[0] - 0.5 * single[1])))
+    print(f"tensor-valued row consistency max abs diff: {max_abs:.3e}")
+    assert np.allclose(single[0], 0.5 * single[1], atol=1e-13, rtol=0)
+
+
+def test_gsl_vector_from_component_splines_matches_components():
+    nodes, component_functions, F = _vector_case_2d()
+    ncomp = F.shape[-1]
+
+    gsl_scalars = []
+    jax_scalars = []
+    for comp in range(ncomp):
+        F_comp = np.ascontiguousarray(F[..., comp])
+        gsl_scalars.append(TPI.TP_Interpolant_ND(list(nodes), F=F_comp))
+        jax_scalars.append(TPI_jax.TP_Interpolant_ND(list(nodes), F=F_comp))
+
+    # combine from coefficient arrays, GSL interpolants, and JAX interpolants
+    from_coeffs = TPI.TP_Interpolant_ND_Vector.FromComponentSplines(
+        list(nodes), [np.asarray(interp.GetSplineCoefficientsND()) for interp in gsl_scalars]
+    )
+    from_gsl = TPI.TP_Interpolant_ND_Vector.FromComponentSplines(list(nodes), gsl_scalars)
+    from_jax = TPI.TP_Interpolant_ND_Vector.FromComponentSplines(list(nodes), jax_scalars)
+
+    points = _single_chain_interior_points(nodes, count=10)
+    scalar_values = np.stack(
+        [
+            np.asarray([gsl_scalars[comp].TPInterpolationND(p) for p in points])
+            for comp in range(ncomp)
+        ],
+        axis=-1,
+    )
+    for label, combined, atol in (
+        ("coeff arrays", from_coeffs, 1e-14),
+        ("GSL interpolants", from_gsl, 1e-14),
+        ("JAX interpolants", from_jax, 1e-10),
+    ):
+        combined_values = np.stack([np.asarray(combined.TPInterpolationND(p)) for p in points])
+        max_abs = float(np.max(np.abs(combined_values - scalar_values)))
+        print(f"FromComponentSplines({label}) max abs diff vs scalar splines: {max_abs:.3e}")
+        assert combined_values.shape == (10, ncomp)
+        assert np.allclose(combined_values, scalar_values, atol=atol, rtol=0)
+
+    # values_shape reshaping of the stacked components
+    from_shaped = TPI.TP_Interpolant_ND_Vector.FromComponentSplines(
+        list(nodes), gsl_scalars + gsl_scalars, values_shape=(2, 3)
+    )
+    shaped = np.asarray(from_shaped.TPInterpolationND(points[0]))
+    assert shaped.shape == (2, 3)
+    assert np.allclose(shaped[0], shaped[1], atol=0, rtol=0)
+    assert np.allclose(shaped[0], scalar_values[0], atol=1e-14, rtol=0)
+
+    with pytest.raises(ValueError):
+        TPI.TP_Interpolant_ND_Vector.FromComponentSplines(list(nodes), [])
+    with pytest.raises(ValueError):
+        TPI.TP_Interpolant_ND_Vector.FromComponentSplines(list(nodes), [np.zeros((3, 3))])
+    with pytest.raises(ValueError):
+        TPI.TP_Interpolant_ND_Vector.FromComponentSplines(
+            list(nodes), gsl_scalars, values_shape=(2, 2)
+        )
+
+
+def test_gsl_vector_valued_shape_and_range_errors():
+    nodes, component_functions, F = _vector_case_2d()
+
+    with pytest.raises(ValueError):
+        TPI.TP_Interpolant_ND_Vector(list(nodes), values_shape=(0,))
+
+    interp = TPI.TP_Interpolant_ND_Vector(list(nodes), values_shape=(3,))
+    with pytest.raises(ValueError):
+        interp.ComputeSplineCoefficientsND(F[..., :2])
+    with pytest.raises(ValueError):
+        interp.ComputeSplineCoefficientsND(F[..., 0])
+    with pytest.raises(ValueError):
+        interp.SetSplineCoefficientsND(np.zeros(tuple(len(node) + 2 for node in nodes)))
+
+    interp.ComputeSplineCoefficientsND(F)
+    with pytest.raises(ValueError, match="outside of knots"):
+        interp.TPInterpolationND(np.array([0.5, 0.0]))  # x outside [0.1, 0.25]
+    with pytest.raises(ValueError):
+        interp(np.array([0.16, 0.28, 0.0]))  # wrong dimension
+
+
+def test_gsl_vector_valued_boundary_points_match_per_component():
+    nodes, component_functions, F = _vector_case_2d()
+    ncomp = F.shape[-1]
+
+    vector_interp = TPI.TP_Interpolant_ND_Vector(list(nodes), values_shape=(ncomp,), F=F)
+    scalar_interps = [
+        TPI.TP_Interpolant_ND(list(nodes), F=np.ascontiguousarray(F[..., comp]))
+        for comp in range(ncomp)
+    ]
+
+    xi, yi = nodes
+    # left endpoint, right endpoint, and a sample of interior nodes (10 points)
+    points = np.array(
+        [
+            [xi[0], yi[0]],
+            [xi[-1], yi[-1]],
+            [xi[0], yi[-1]],
+            [xi[-1], yi[0]],
+            [xi[3], yi[5]],
+            [xi[5], yi[2]],
+            [xi[7], yi[9]],
+            [xi[2], yi[11]],
+            [xi[8], yi[7]],
+            [xi[4], yi[4]],
+        ],
+        dtype=np.float64,
+    )
+    vector_values = np.stack([np.asarray(vector_interp.TPInterpolationND(p)) for p in points])
+    scalar_values = np.stack(
+        [
+            np.asarray([scalar_interps[comp].TPInterpolationND(point) for point in points])
+            for comp in range(ncomp)
+        ],
+        axis=-1,
+    )
+    abs_diff = np.abs(vector_values - scalar_values)
+    idx = np.unravel_index(np.argmax(abs_diff), abs_diff.shape)
+    rel_diff = abs_diff / np.maximum(np.abs(scalar_values), np.finfo(np.float64).tiny)
+    ridx = np.unravel_index(np.argmax(rel_diff), rel_diff.shape)
+    print(f"max abs diff: {abs_diff[idx]:.3e} at point={points[idx[0]]}, component={idx[1]}")
+    print(f"max rel diff: {rel_diff[ridx]:.3e} at point={points[ridx[0]]}, component={ridx[1]}")
+    assert np.allclose(vector_values, scalar_values, atol=1e-14, rtol=0)
+
+
 def test_jax_batched_public_path_is_jit_cached_and_tracks_coefficients():
     xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
     yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])

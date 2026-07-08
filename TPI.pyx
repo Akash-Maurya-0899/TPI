@@ -79,7 +79,17 @@ cdef extern from "TensorProductInterpolation.h":
         gsl_bspline_workspace **bw,
         double *y
     );
-    
+
+    int TP_Interpolation_ND_Vector(
+        double *v,
+        int n,
+        double *X,
+        int m,
+        int p,
+        gsl_bspline_workspace **bw,
+        double *y
+    );
+
     int AssembleSplineMatrix_C(
         gsl_vector *xi,
         gsl_matrix *phi,
@@ -292,6 +302,191 @@ cdef class TP_Interpolant_ND:
         # For contiguous float64 input this is a no-copy view; otherwise the
         # coefficients are converted once here instead of on every evaluation.
         self.c_flat = np.ascontiguousarray(coeffs, dtype=np.double).ravel()
+
+
+cdef class TP_Interpolant_ND_Vector(TP_Interpolant_ND):
+
+    """Tensor product spline class for vector/tensor-valued data in N dimensions.
+
+    Behaves like TP_Interpolant_ND, except the grid data F carries trailing
+    value axes of shape values_shape and interpolation returns arrays of that
+    shape. All components share the grid, knot vectors, and spline matrices;
+    the coefficient solve treats the value axes as extra right-hand sides and
+    the evaluation shares the span search and B-spline basis products across
+    components, so interpolating an M-component field costs far less than M
+    scalar interpolants.
+
+    Shapes:
+      * F passed to ComputeSplineCoefficientsND: grid dims + values_shape
+      * coefficients: tuple(len(nodes_i) + 2) + values_shape
+      * TPInterpolationND(X): values_shape
+
+    """
+
+    cdef _values_shape
+    cdef int _values_size
+
+    def __init__(self, list nodes, values_shape, coeffs=None, F=None):
+        """Constructor
+
+        Arguments:
+          * nodes:        list of 1D arrays defining grid points in each dimension,
+                          as for TP_Interpolant_ND.
+          * values_shape: shape of the function value at each grid point, e.g. (3,)
+                          for a 3-vector or (2, 3) for a matrix-valued function.
+          * coeffs:       (optional) tensor product spline coefficients of shape
+                          tuple(len(nodes_i) + 2) + values_shape.
+          * F:            (optional) data on the Cartesian product grid, of shape
+                          grid dims + values_shape.
+
+        """
+        try:
+            shape_tuple = tuple(int(s) for s in np.atleast_1d(values_shape))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("values_shape must be a shape of positive integers.") from exc
+        if len(shape_tuple) == 0 or any(s < 1 for s in shape_tuple):
+            raise ValueError("values_shape must be a shape of positive integers.")
+        self._values_shape = shape_tuple
+        self._values_size = int(np.prod(shape_tuple))
+        super().__init__(nodes, coeffs=coeffs, F=F)
+
+    @classmethod
+    def FromComponentSplines(cls, nodes, components, values_shape=None):
+        """Combine per-component splines sharing one grid into one vector-valued spline.
+
+        Arguments:
+          * nodes: list of 1D node arrays, as for the constructor. Every
+            component must have been built on exactly these nodes.
+          * components: list whose entries are either per-component spline
+            coefficient arrays of shape tuple(len(nodes_i) + 2), or objects
+            exposing GetSplineCoefficientsND() (TPI or TPI_jax interpolants).
+          * values_shape: optional shape for the value axes; defaults to
+            (len(components),). Its product must equal len(components); the
+            components fill the value axes in C (row-major) order.
+
+        Returns a TP_Interpolant_ND_Vector with the stacked coefficients set.
+
+        """
+        coeff_arrays = []
+        for component in components:
+            if hasattr(component, "GetSplineCoefficientsND"):
+                component = component.GetSplineCoefficientsND()
+            coeff_arrays.append(np.asarray(component, dtype=np.float64))
+        if not coeff_arrays:
+            raise ValueError("Expected at least one component spline.")
+
+        expected = tuple(len(np.asarray(node)) + 2 for node in nodes)
+        for index, coeff in enumerate(coeff_arrays):
+            if coeff.shape != expected:
+                raise ValueError(
+                    "Component %d coefficients have shape %s, expected %s; "
+                    "all components must share the same nodes."
+                    % (index, list(coeff.shape), list(expected))
+                )
+
+        stacked = np.stack(coeff_arrays, axis=-1)
+        if values_shape is None:
+            values_shape = (len(coeff_arrays),)
+        else:
+            values_shape = tuple(int(s) for s in np.atleast_1d(values_shape))
+            if int(np.prod(values_shape)) != len(coeff_arrays):
+                raise ValueError(
+                    "values_shape %s does not hold %d components."
+                    % (list(values_shape), len(coeff_arrays))
+                )
+            stacked = stacked.reshape(expected + values_shape)
+        return cls(list(nodes), values_shape, coeffs=stacked)
+
+    def ComputeSplineCoefficientsND(self, F):
+        """Compute tensor product spline coefficients for vector-valued data F.
+
+        Arguments:
+          * F : data on the Cartesian product grid passed to the constructor,
+                with trailing value axes: shape = grid dims + values_shape.
+
+        Returns:
+          * c: the coefficient tensor of shape tuple(len(nodes_i) + 2) + values_shape
+
+        """
+        nodesND = self.nodes
+        dims = list(map(len, nodesND))
+        d = len(dims)
+        values_shape = self._values_shape
+
+        if not np.shape(F) == tuple(dims) + values_shape:
+            raise ValueError(
+                "Data on TP grid should have shape {}".format(list(dims) + list(values_shape))
+            )
+
+        # Compute 1D spline matrices and knot vectors
+        inv_1d_matrices = []
+        knots_list = []
+        cdef unsigned int i
+        for i in range(d):
+            b = BsplineBasis1D(nodesND[i])
+            A, knots = b.AssembleSplineMatrix()
+            Ainv = np.linalg.inv(A)
+            inv_1d_matrices.append(Ainv)
+            knots_list.append(knots)
+        self.knots_list = knots_list
+
+        # pad only the grid axes with zeroes (2 more equations per grid axis with
+        # the not-a-knot conditions); value axes ride along as extra right-hand sides
+        F0 = np.pad(F, [(1, 1)] * d + [(0, 0)] * len(values_shape), 'constant')
+
+        # Solve a sequence of linear systems to obtain the coefficient tensor.
+        # Contracting axis d-1 always targets the last unsolved grid axis because
+        # tensordot moves the solved axis to the front and the value axes stay trailing.
+        tmp_result = F0
+        for minv in inv_1d_matrices[::-1]:
+            tmp_result = np.tensordot(minv, tmp_result, (1, d - 1))
+        self.c = tmp_result
+        # ravel() is a no-copy view here since tmp_result is a fresh contiguous array
+        self.c_flat = np.ascontiguousarray(tmp_result, dtype=np.double).ravel()
+        return self.c
+
+    def SetSplineCoefficientsND(self, coeffs):
+        """Set tensor product spline coefficients.
+
+        Arguments:
+          * coeffs: array of shape tuple(len(nodes_i) + 2) + values_shape
+                    holding the tensor product spline coefficients
+
+        """
+        dims = tuple(len(x) + 2 for x in self.nodes) + self._values_shape
+
+        if not np.shape(coeffs) == dims:
+            raise ValueError("Spline coefficients should have shape {}".format(list(dims)))
+
+        self.c = coeffs
+        # For contiguous float64 input this is a no-copy view; otherwise the
+        # coefficients are converted once here instead of on every evaluation.
+        self.c_flat = np.ascontiguousarray(coeffs, dtype=np.double).ravel()
+
+    def TPInterpolationND(self, np.ndarray[np.double_t,ndim=1] X):
+        """Carry out vector-valued tensor product spline interpolation at point X.
+
+        Arguments:
+          * X: a 1D numpy array of floats.
+
+        Returns:
+          * y: the interpolant evaluated at X, an array of shape values_shape.
+
+        """
+        cdef np.ndarray[np.double_t,ndim=1] c = self.c_flat
+        cdef np.ndarray[np.double_t,ndim=1] y = np.empty(self._values_size, dtype=np.double)
+        cdef int ret = TP_Interpolation_ND_Vector(<double*> c.data, len(c),
+                        <double*> X.data, len(X), self._values_size,
+                        self.bw_array_ptrs, <double*> y.data)
+        cdef double x_min, x_max;
+        if ret == TPI_FAIL:
+            for i in range(self.n):
+                x_min = self.nodes[i][0]
+                x_max = self.nodes[i][-1]
+                if (X[i] < x_min or X[i] > x_max):
+                    raise ValueError("TP_Interpolation_ND: X[%d] = %g is outside of "
+                    "knots vector [%g, %g]!" % (i, X[i], x_min, x_max))
+        return y.reshape(self._values_shape)
 
 
 cdef class BsplineBasis1D:

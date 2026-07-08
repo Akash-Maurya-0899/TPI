@@ -176,6 +176,116 @@ int TP_Interpolation_ND(
     return TPI_SUCCESS;
 }
 
+int TP_Interpolation_ND_Vector(
+    double *v,                    // Input: flattened TP spline coefficient array with
+                                  // p contiguous components per grid coefficient
+    int n,                        // Input: length of TP spline coefficient array v
+    double* X,                    // Input: parameter space evaluation point of length m
+    int m,                        // Input: dimensionality of parameter space
+    int p,                        // Input: number of value components per grid point
+    gsl_bspline_workspace **bw,   // Input: array of pointers to B-spline workspaces
+    double *y                     // Output: TP spline evaluated at X, array of length p
+) {
+// Vector-valued variant of TP_Interpolation_ND: the coefficient array carries p
+// contiguous components per grid coefficient (value axes trailing in C order).
+// The span search and B-spline basis products are computed once and shared by
+// all components; only the final coefficient accumulation scales with p.
+
+#ifdef CHECK_RANGES
+    for (int j=0; j<m; j++) {
+        gsl_vector* knots = bw[j]->knots;
+        double x_min = gsl_vector_get(knots, 0);
+        double x_max = gsl_vector_get(knots, knots->size - 1);
+        if (X[j] < x_min || X[j] > x_max) {
+            return TPI_FAIL;
+        }
+    }
+#endif
+
+    int nc[m];
+    gsl_vector *B[m];
+    size_t is[m]; // first non-zero spline
+    size_t ie[m]; // last non-zero spline
+    for (int j=0; j<m; j++) {
+        // Dimensionality of coefficients for each dimension
+        nc[j] = bw[j]->n;
+
+        // Store nonzero cubic (order k=4) B-spline basis functions
+        B[j] = gsl_vector_alloc(4);
+
+        // Evaluate all potentially nonzero cubic B-spline basis functions at X
+        // and store them in the array of vectors Bx[].
+        // Since the B-splines are of compact support we only need to store a small
+        // number of basis functions to avoid computing terms that would be zero anyway.
+        gsl_bspline_eval_nonzero(X[j], B[j], &is[j], &ie[j], bw[j]);
+    }
+
+    // Accumulate all p components of the TP spline interpolant
+    for (int k=0; k<p; k++)
+        y[k] = 0;
+
+    // Start logic of dynamic nested loop of depth m
+    int max = 4; // upper bound of each nested loop
+    int *slots = (int *) malloc(sizeof(int) * m); // m indices in range(0, 4)
+
+    // Store the products of the first k bsplines, and the kth partial sums of the indices.
+    // Prepend the identity so we can always index with [i-1].
+    double *b_prod_hierarchy = (double *) malloc(sizeof(double) * (m+1));
+    int *i_sum_hierarchy = (int *) malloc(sizeof(int) * (m+1));
+
+    // Initialize the indices and current bspline products
+    int idx_sum = 0;
+    double product = 1;
+    b_prod_hierarchy[0] = 1;
+    i_sum_hierarchy[0] = 0;
+    for (int i = 0; i < m; i++) {
+        slots[i] = 0;
+        product *= gsl_vector_get(B[i], 0);
+        b_prod_hierarchy[i+1] = product;
+        idx_sum = idx_sum * nc[i] + is[i];
+        i_sum_hierarchy[i+1] = idx_sum;
+    }
+
+    // Loop over last index first, loop over first index last.
+    int index;
+
+    while (true) {
+        // Add the current coefficient block times the product of all current bsplines
+        const double b_prod = b_prod_hierarchy[m];
+        const double *vp = v + (size_t)i_sum_hierarchy[m] * p;
+        for (int k=0; k<p; k++)
+            y[k] += vp[k] * b_prod;
+
+        // Update the slots to the next valid configuration
+        slots[m-1]++;
+        index = m-1;
+        while (slots[index] == max) {
+            // Overflow, we're done
+            if (index == 0)
+                goto cleanup;
+
+            slots[index--] = 0;
+            slots[index]++;
+        }
+
+        // Now update the index sums and bspline products for anything that was altered
+        while (index < m) {
+            b_prod_hierarchy[index+1] = b_prod_hierarchy[index] * gsl_vector_get(B[index], slots[index]);
+            i_sum_hierarchy[index+1] = i_sum_hierarchy[index] * nc[index] + is[index] + slots[index];
+            index++;
+        }
+    }
+
+    cleanup:
+    for (int j=0; j<m; j++)
+        gsl_vector_free(B[j]);
+    free(slots);
+    free(b_prod_hierarchy);
+    free(i_sum_hierarchy);
+
+    return TPI_SUCCESS;
+}
+
 int TP_Interpolation_N_slowD(
     double *v,                    // Input: flattened TP spline coefficient array
     int n,                        // Input: length of TP spline coefficient array v

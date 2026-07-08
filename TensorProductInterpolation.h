@@ -96,3 +96,14 @@ int TP_Interpolation_ND(
     gsl_bspline_workspace **bw,         // Input: array of pointers to B-spline workspaces
     double *y                           // Output: TP spline evaluated at X
 );
+
+int TP_Interpolation_ND_Vector(
+    double *v,                          // Input: flattened TP spline coefficient array with
+                                        // p contiguous components per grid coefficient
+    int n,                              // Input: length of TP spline coefficient array v
+    double* X,                          // Input: parameter space evaluation point of length m
+    int m,                              // Input: dimensionality of parameter space
+    int p,                              // Input: number of value components per grid point
+    gsl_bspline_workspace **bw,         // Input: array of pointers to B-spline workspaces
+    double *y                           // Output: TP spline evaluated at X, array of length p
+);
