@@ -1937,6 +1937,38 @@ def test_gsl_call_dispatches_single_point_and_batch():
         scalar_interp(points[:, :, np.newaxis])
 
 
+def test_jax_call_dispatches_single_point_and_batch():
+    nodes, component_functions, F = _vector_case_2d()
+    jax_scalar = TPI_jax.TP_Interpolant_ND(list(nodes), F=np.ascontiguousarray(F[..., 0]))
+    jax_vector = TPI_jax.TP_Interpolant_ND_Vector(list(nodes), values_shape=(3,), F=F)
+    gsl_scalar = TPI.TP_Interpolant_ND(list(nodes), F=np.ascontiguousarray(F[..., 0]))
+    points = _single_chain_interior_points(nodes, count=16)
+
+    # warmup: trigger JIT compilation before assertions
+    jax_scalar.TPInterpolationND_batched(points[:1])
+    jax_vector.TPInterpolationND_batched(points[:1])
+
+    assert np.allclose(
+        np.asarray(jax_scalar(points)),
+        np.asarray(jax_scalar.TPInterpolationND_batched(points)),
+        atol=0,
+        rtol=0,
+    )
+    assert np.asarray(jax_vector(points)).shape == (points.shape[0], 3)
+    assert np.allclose(
+        np.asarray(jax_vector(points)),
+        np.asarray(jax_vector.TPInterpolationND_batched(points)),
+        atol=0,
+        rtol=0,
+    )
+    # the two backends' __call__ agree on the same batch
+    max_abs = float(np.max(np.abs(np.asarray(jax_scalar(points)) - np.asarray(gsl_scalar(points)))))
+    print(f"__call__ batch max abs diff GSL vs JAX: {max_abs:.3e}")
+    assert max_abs < 1e-10
+    with pytest.raises(ValueError):
+        jax_scalar(points[:, :, np.newaxis])
+
+
 def test_gsl_batched_faster_than_python_loop():
     # The batched path exists to amortize the Python call overhead and the
     # per-call workspace allocations; with 10k points it must beat the loop.

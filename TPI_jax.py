@@ -566,8 +566,13 @@ class TP_Interpolant_ND:
 
     def __call__(self, X):
         X_arr = np.atleast_1d(np.asarray(X, dtype=np.float64))
+        if X_arr.ndim == 2:
+            return self.TPInterpolationND_batched(X_arr)
         if X_arr.ndim != 1:
-            raise ValueError("Evaluation point X is more than one-dimensional!")
+            raise ValueError(
+                "Evaluation point X must be one-dimensional (a single point) "
+                "or two-dimensional (a batch of points)!"
+            )
         if X_arr.shape[0] != self.n:
             raise ValueError(
                 f"Expected X to be array of length {self.n}, but got length {X_arr.shape[0]}"
