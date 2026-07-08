@@ -107,3 +107,29 @@ int TP_Interpolation_ND_Vector(
     gsl_bspline_workspace **bw,         // Input: array of pointers to B-spline workspaces
     double *y                           // Output: TP spline evaluated at X, array of length p
 );
+
+int TP_Interpolation_ND_Batch(
+    double *v,                          // Input: flattened TP spline coefficient array
+    int n,                              // Input: length of TP spline coefficient array v
+    double* X,                          // Input: M parameter space points, M x m row-major
+    int M,                              // Input: number of evaluation points
+    int m,                              // Input: dimensionality of parameter space
+    gsl_bspline_workspace **bw,         // Input: array of pointers to B-spline workspaces
+    double *y,                          // Output: TP spline evaluated at the M points
+    int *fail_point,                    // Output: on TPI_FAIL, index of first out-of-range point
+    int *fail_axis                      // Output: on TPI_FAIL, axis of the range violation
+);
+
+int TP_Interpolation_ND_Vector_Batch(
+    double *v,                          // Input: flattened TP spline coefficient array with
+                                        // p contiguous components per grid coefficient
+    int n,                              // Input: length of TP spline coefficient array v
+    double* X,                          // Input: M parameter space points, M x m row-major
+    int M,                              // Input: number of evaluation points
+    int m,                              // Input: dimensionality of parameter space
+    int p,                              // Input: number of value components per grid point
+    gsl_bspline_workspace **bw,         // Input: array of pointers to B-spline workspaces
+    double *y,                          // Output: TP spline evaluated at the M points, M x p row-major
+    int *fail_point,                    // Output: on TPI_FAIL, index of first out-of-range point
+    int *fail_axis                      // Output: on TPI_FAIL, axis of the range violation
+);

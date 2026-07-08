@@ -90,6 +90,31 @@ cdef extern from "TensorProductInterpolation.h":
         double *y
     );
 
+    int TP_Interpolation_ND_Batch(
+        double *v,
+        int n,
+        double *X,
+        int M,
+        int m,
+        gsl_bspline_workspace **bw,
+        double *y,
+        int *fail_point,
+        int *fail_axis
+    ) nogil;
+
+    int TP_Interpolation_ND_Vector_Batch(
+        double *v,
+        int n,
+        double *X,
+        int M,
+        int m,
+        int p,
+        gsl_bspline_workspace **bw,
+        double *y,
+        int *fail_point,
+        int *fail_axis
+    ) nogil;
+
     int AssembleSplineMatrix_C(
         gsl_vector *xi,
         gsl_matrix *phi,
@@ -227,10 +252,68 @@ cdef class TP_Interpolant_ND:
                     "is outside of knots vector [%g, %g]!\n", i, X[i], x_min, x_max);
         return y
 
+    def _validate_batch(self, X):
+        """Coerce X to a contiguous (M, n) float64 array, validating its shape."""
+        if self.c_flat is None:
+            raise ValueError("Spline coefficients have not been set.")
+        X_arr = np.asarray(X, dtype=np.double)
+        if X_arr.ndim != 2:
+            raise ValueError("Evaluation batch X must be two-dimensional!")
+        if X_arr.shape[1] != self.n:
+            raise ValueError("Expected X to have shape (M, %d), "
+            "but got shape %s" % (self.n, X_arr.shape))
+        return np.ascontiguousarray(X_arr)
+
+    def _raise_batch_range_error(self, X_arr, int fail_point, int fail_axis):
+        x_min = self.nodes[fail_axis][0]
+        x_max = self.nodes[fail_axis][-1]
+        raise ValueError("TP_Interpolation_ND: X[%d, %d] = %g is outside of "
+        "knots vector [%g, %g]!" % (fail_point, fail_axis,
+        X_arr[fail_point, fail_axis], x_min, x_max))
+
+    def TPInterpolationND_batched(self, X):
+        """Carry out tensor product spline interpolation at a batch of points.
+
+        The B-spline workspaces and loop bookkeeping are set up once for the
+        whole batch and the GIL is released while the C loop runs, so this is
+        much faster than calling TPInterpolationND in a Python loop.
+
+        Arguments:
+          * X: a 2D numpy array of floats of shape (M, len(nodes)).
+
+        Returns:
+          * y: the interpolant evaluated at the M points, a 1D array of length M.
+
+        """
+        cdef np.ndarray[np.double_t,ndim=2] X_arr = self._validate_batch(X)
+        cdef int M = X_arr.shape[0]
+        if M == 0:
+            return np.empty(0, dtype=np.double)
+        cdef np.ndarray[np.double_t,ndim=1] c = self.c_flat
+        cdef np.ndarray[np.double_t,ndim=1] y = np.empty(M, dtype=np.double)
+        cdef double *c_data = <double*> c.data
+        cdef int c_len = len(c)
+        cdef double *X_data = <double*> X_arr.data
+        cdef double *y_data = <double*> y.data
+        cdef int nd = self.n
+        cdef gsl_bspline_workspace **bw = self.bw_array_ptrs
+        cdef int fail_point = -1
+        cdef int fail_axis = -1
+        cdef int ret
+        with nogil:
+            ret = TP_Interpolation_ND_Batch(c_data, c_len, X_data, M, nd,
+                                            bw, y_data, &fail_point, &fail_axis)
+        if ret == TPI_FAIL:
+            self._raise_batch_range_error(X_arr, fail_point, fail_axis)
+        return y
+
     def __call__(self, X):
         X_array = np.atleast_1d(np.array(X, dtype=np.double))
+        if X_array.ndim == 2:
+            return self.TPInterpolationND_batched(X_array)
         if len(X_array.shape) != 1:
-            raise ValueError("Evaluation point X is more than one-dimensional!")
+            raise ValueError("Evaluation point X must be one-dimensional "
+            "(a single point) or two-dimensional (a batch of points)!")
         if X_array.shape[0] != self.n:
             raise ValueError("Expected X to be array of length %d, "
             "but got length %d"%(self.n, X_array.shape[0]))
@@ -487,6 +570,46 @@ cdef class TP_Interpolant_ND_Vector(TP_Interpolant_ND):
                     raise ValueError("TP_Interpolation_ND: X[%d] = %g is outside of "
                     "knots vector [%g, %g]!" % (i, X[i], x_min, x_max))
         return y.reshape(self._values_shape)
+
+    def TPInterpolationND_batched(self, X):
+        """Carry out vector-valued tensor product spline interpolation at a batch of points.
+
+        As for TP_Interpolant_ND.TPInterpolationND_batched, the per-point setup
+        is shared across the batch and the GIL is released while the C loop
+        runs; additionally the span search and B-spline basis products are
+        shared across all value components at each point.
+
+        Arguments:
+          * X: a 2D numpy array of floats of shape (M, len(nodes)).
+
+        Returns:
+          * y: the interpolant evaluated at the M points, an array of shape
+               (M,) + values_shape.
+
+        """
+        cdef np.ndarray[np.double_t,ndim=2] X_arr = self._validate_batch(X)
+        cdef int M = X_arr.shape[0]
+        if M == 0:
+            return np.empty((0,) + self._values_shape, dtype=np.double)
+        cdef np.ndarray[np.double_t,ndim=1] c = self.c_flat
+        cdef np.ndarray[np.double_t,ndim=1] y = np.empty(M * self._values_size, dtype=np.double)
+        cdef double *c_data = <double*> c.data
+        cdef int c_len = len(c)
+        cdef double *X_data = <double*> X_arr.data
+        cdef double *y_data = <double*> y.data
+        cdef int nd = self.n
+        cdef int p = self._values_size
+        cdef gsl_bspline_workspace **bw = self.bw_array_ptrs
+        cdef int fail_point = -1
+        cdef int fail_axis = -1
+        cdef int ret
+        with nogil:
+            ret = TP_Interpolation_ND_Vector_Batch(c_data, c_len, X_data, M, nd,
+                                                   p, bw, y_data,
+                                                   &fail_point, &fail_axis)
+        if ret == TPI_FAIL:
+            self._raise_batch_range_error(X_arr, fail_point, fail_axis)
+        return y.reshape((M,) + self._values_shape)
 
 
 cdef class BsplineBasis1D:

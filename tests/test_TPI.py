@@ -1769,6 +1769,202 @@ def test_gsl_vector_valued_boundary_points_match_per_component():
     assert np.allclose(vector_values, scalar_values, atol=1e-14, rtol=0)
 
 
+def test_gsl_batched_matches_scalar_loop():
+    # The batched C path performs the identical per-point arithmetic in the
+    # identical order, only with the workspace allocations hoisted out of the
+    # point loop, so the results should agree to the last bit.
+    for dim, nodes, gsl_interp, jax_interp in _single_chain_interpolant_cases():
+        points = _single_chain_interior_points(nodes, count=512)
+        loop_values = np.array([gsl_interp.TPInterpolationND(p) for p in points])
+        batch_values = np.asarray(gsl_interp.TPInterpolationND_batched(points))
+        assert batch_values.shape == (points.shape[0],)
+        max_abs = float(np.max(np.abs(loop_values - batch_values)))
+        print(f"{dim}D batched vs per-point loop max abs diff: {max_abs:.3e}")
+        assert np.allclose(batch_values, loop_values, atol=1e-15, rtol=0)
+
+
+def test_gsl_batched_matches_jax_batched():
+    diagnostics = []
+    for dim, nodes, gsl_interp, jax_interp in _single_chain_interpolant_cases():
+        points = _single_chain_interior_points(nodes, count=64)
+        # warmup: trigger JIT compilation before assertions
+        jax_interp.TPInterpolationND_batched(points[:1])
+        gsl_values = np.asarray(gsl_interp.TPInterpolationND_batched(points))
+        jax_values = np.asarray(jax_interp.TPInterpolationND_batched(points))
+        for point, gsl_value, jax_value in zip(points, gsl_values, jax_values):
+            diagnostics.append((dim, point, gsl_value, jax_value))
+    actual, expected = _print_max_diffs(diagnostics)
+    assert np.allclose(actual, expected, atol=1e-10, rtol=0)
+
+
+def test_gsl_vector_batched_matches_per_point_and_components():
+    for case in (_vector_case_2d(), _vector_case_3d()):
+        nodes, component_functions, F = case
+        ncomp = F.shape[-1]
+        dim = len(nodes)
+
+        vector_interp = TPI.TP_Interpolant_ND_Vector(list(nodes), values_shape=(ncomp,), F=F)
+        points = _single_chain_interior_points(nodes, count=128)
+
+        batch_values = np.asarray(vector_interp.TPInterpolationND_batched(points))
+        assert batch_values.shape == (points.shape[0], ncomp)
+
+        # identical arithmetic to the per-point vector evaluation
+        loop_values = np.stack([np.asarray(vector_interp.TPInterpolationND(p)) for p in points])
+        max_abs = float(np.max(np.abs(batch_values - loop_values)))
+        print(f"{dim}D vector batched vs per-point loop max abs diff: {max_abs:.3e}")
+        assert np.allclose(batch_values, loop_values, atol=1e-15, rtol=0)
+
+        # per-component scalar batched evaluations
+        scalar_values = np.stack(
+            [
+                np.asarray(
+                    TPI.TP_Interpolant_ND(
+                        list(nodes), F=np.ascontiguousarray(F[..., comp])
+                    ).TPInterpolationND_batched(points)
+                )
+                for comp in range(ncomp)
+            ],
+            axis=-1,
+        )
+        max_abs = float(np.max(np.abs(batch_values - scalar_values)))
+        print(f"{dim}D vector batched vs scalar batched max abs diff: {max_abs:.3e}")
+        assert np.allclose(batch_values, scalar_values, atol=1e-14, rtol=0)
+
+    # tensor-valued output keeps the trailing value axes per point
+    nodes, component_functions, F = _vector_case_2d()
+    F_tensor = np.concatenate([F, 2.0 * F], axis=-1).reshape(F.shape[:-1] + (2, 3))
+    tensor_interp = TPI.TP_Interpolant_ND_Vector(list(nodes), values_shape=(2, 3), F=F_tensor)
+    points = _single_chain_interior_points(nodes, count=16)
+    tensor_values = np.asarray(tensor_interp.TPInterpolationND_batched(points))
+    assert tensor_values.shape == (points.shape[0], 2, 3)
+    single_values = np.stack([np.asarray(tensor_interp.TPInterpolationND(p)) for p in points])
+    assert np.allclose(tensor_values, single_values, atol=1e-15, rtol=0)
+
+
+def test_gsl_batched_boundary_points_match_per_point():
+    for dim, nodes, gsl_interp, jax_interp in _single_chain_interpolant_cases():
+        lows = np.array([node[0] for node in nodes], dtype=np.float64)
+        highs = np.array([node[-1] for node in nodes], dtype=np.float64)
+        mids = np.array([node[len(node) // 2] for node in nodes], dtype=np.float64)
+        # both corners, a grid node, and points on single-axis boundaries
+        points = [lows, highs, mids]
+        for axis in range(dim):
+            low_edge = mids.copy()
+            low_edge[axis] = lows[axis]
+            high_edge = mids.copy()
+            high_edge[axis] = highs[axis]
+            points.extend([low_edge, high_edge])
+        points = np.array(points, dtype=np.float64)
+        loop_values = np.array([gsl_interp.TPInterpolationND(p) for p in points])
+        batch_values = np.asarray(gsl_interp.TPInterpolationND_batched(points))
+        max_abs = float(np.max(np.abs(loop_values - batch_values)))
+        print(f"{dim}D batched boundary points max abs diff: {max_abs:.3e}")
+        assert np.allclose(batch_values, loop_values, atol=1e-15, rtol=0)
+
+
+def test_gsl_batched_shape_and_range_errors():
+    nodes, component_functions, F = _vector_case_2d()
+    scalar_interp = TPI.TP_Interpolant_ND(list(nodes), F=np.ascontiguousarray(F[..., 0]))
+    vector_interp = TPI.TP_Interpolant_ND_Vector(list(nodes), values_shape=(3,), F=F)
+    points = _single_chain_interior_points(nodes, count=8)
+
+    for interp in (scalar_interp, vector_interp):
+        with pytest.raises(ValueError, match="two-dimensional"):
+            interp.TPInterpolationND_batched(points[0])
+        with pytest.raises(ValueError, match="two-dimensional"):
+            interp.TPInterpolationND_batched(points[:, :, np.newaxis])
+        with pytest.raises(ValueError, match="shape"):
+            interp.TPInterpolationND_batched(points[:, :1])
+
+        # the error names the first offending point in batch order and its axis
+        bad = points.copy()
+        bad[5, 1] = 3.0  # y outside [-1, 1]
+        bad[6, 0] = 0.5  # x outside [0.1, 0.25]
+        with pytest.raises(ValueError, match=r"X\[5, 1\]"):
+            interp.TPInterpolationND_batched(bad)
+
+    unset = TPI.TP_Interpolant_ND(list(nodes))
+    with pytest.raises(ValueError, match="coefficients"):
+        unset.TPInterpolationND_batched(points)
+
+
+def test_gsl_batched_edge_cases_and_noncontiguous_input():
+    nodes, component_functions, F = _vector_case_2d()
+    scalar_interp = TPI.TP_Interpolant_ND(list(nodes), F=np.ascontiguousarray(F[..., 0]))
+    vector_interp = TPI.TP_Interpolant_ND_Vector(list(nodes), values_shape=(3,), F=F)
+    points = _single_chain_interior_points(nodes, count=64)
+
+    # empty batch
+    assert np.asarray(scalar_interp.TPInterpolationND_batched(points[:0])).shape == (0,)
+    assert np.asarray(vector_interp.TPInterpolationND_batched(points[:0])).shape == (0, 3)
+
+    # single-point batch
+    single = np.asarray(scalar_interp.TPInterpolationND_batched(points[:1]))
+    assert single.shape == (1,)
+    assert np.allclose(single[0], scalar_interp.TPInterpolationND(points[0]), atol=1e-15, rtol=0)
+
+    # non-contiguous inputs are copied to contiguous storage internally
+    reference = np.asarray(scalar_interp.TPInterpolationND_batched(points))
+    strided = np.asarray(scalar_interp.TPInterpolationND_batched(points[::2]))
+    assert np.allclose(strided, reference[::2], atol=1e-15, rtol=0)
+    fortran = np.asarray(scalar_interp.TPInterpolationND_batched(np.asfortranarray(points)))
+    assert np.allclose(fortran, reference, atol=1e-15, rtol=0)
+
+
+def test_gsl_call_dispatches_single_point_and_batch():
+    nodes, component_functions, F = _vector_case_2d()
+    scalar_interp = TPI.TP_Interpolant_ND(list(nodes), F=np.ascontiguousarray(F[..., 0]))
+    vector_interp = TPI.TP_Interpolant_ND_Vector(list(nodes), values_shape=(3,), F=F)
+    points = _single_chain_interior_points(nodes, count=16)
+
+    assert np.allclose(
+        scalar_interp(points[0]), scalar_interp.TPInterpolationND(points[0]), atol=0, rtol=0
+    )
+    assert np.allclose(
+        np.asarray(scalar_interp(points)),
+        np.asarray(scalar_interp.TPInterpolationND_batched(points)),
+        atol=0,
+        rtol=0,
+    )
+    assert np.allclose(
+        np.asarray(vector_interp(points)),
+        np.asarray(vector_interp.TPInterpolationND_batched(points)),
+        atol=0,
+        rtol=0,
+    )
+    with pytest.raises(ValueError):
+        scalar_interp(points[:, :, np.newaxis])
+
+
+def test_gsl_batched_faster_than_python_loop():
+    # The batched path exists to amortize the Python call overhead and the
+    # per-call workspace allocations; with 10k points it must beat the loop.
+    nodes, component_functions, F = _vector_case_3d()
+    interp = TPI.TP_Interpolant_ND(list(nodes), F=np.ascontiguousarray(F[..., 0]))
+    points = _single_chain_interior_points(nodes, count=10000)
+
+    loop_times_ms = []
+    batch_times_ms = []
+    for _ in range(3):
+        start = time.perf_counter()
+        loop_values = np.array([interp.TPInterpolationND(p) for p in points])
+        loop_times_ms.append((time.perf_counter() - start) * 1e3)
+
+        start = time.perf_counter()
+        batch_values = np.asarray(interp.TPInterpolationND_batched(points))
+        batch_times_ms.append((time.perf_counter() - start) * 1e3)
+
+    assert np.allclose(batch_values, loop_values, atol=1e-15, rtol=0)
+    loop_ms = float(np.median(loop_times_ms))
+    batch_ms = float(np.median(batch_times_ms))
+    print(
+        f"3D eval of {points.shape[0]} points: Python loop {loop_ms:.1f} ms, "
+        f"batched {batch_ms:.1f} ms ({loop_ms / batch_ms:.1f}x)"
+    )
+    assert batch_ms < loop_ms
+
+
 def test_jax_batched_public_path_is_jit_cached_and_tracks_coefficients():
     xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
     yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])

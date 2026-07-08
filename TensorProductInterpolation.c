@@ -286,6 +286,238 @@ int TP_Interpolation_ND_Vector(
     return TPI_SUCCESS;
 }
 
+int TP_Interpolation_ND_Batch(
+    double *v,                    // Input: flattened TP spline coefficient array
+    int n,                        // Input: length of TP spline coefficient array v
+    double* X,                    // Input: M parameter space points, M x m row-major
+    int M,                        // Input: number of evaluation points
+    int m,                        // Input: dimensionality of parameter space
+    gsl_bspline_workspace **bw,   // Input: array of pointers to B-spline workspaces
+    double *y,                    // Output: TP spline evaluated at the M points
+    int *fail_point,              // Output: on TPI_FAIL, index of first out-of-range point
+    int *fail_axis                // Output: on TPI_FAIL, axis of the range violation
+) {
+// Batched variant of TP_Interpolation_ND: evaluates the spline at M points with
+// the basis-function vectors and loop bookkeeping allocated once and reused
+// across points instead of once per point. All points are range-checked up
+// front so that on failure no partial output is written. Touches no Python
+// objects, so it may be called with the GIL released.
+
+#ifdef CHECK_RANGES
+    // Validate all points before evaluating anything so that on failure no
+    // partial output is written. The first offending point in batch order is
+    // reported through fail_point/fail_axis.
+    for (int i=0; i<M; i++) {
+        const double *Xp = X + (size_t)i*m;
+        for (int j=0; j<m; j++) {
+            gsl_vector* knots = bw[j]->knots;
+            double x_min = gsl_vector_get(knots, 0);
+            double x_max = gsl_vector_get(knots, knots->size - 1);
+            if (Xp[j] < x_min || Xp[j] > x_max) {
+                *fail_point = i;
+                *fail_axis = j;
+                return TPI_FAIL;
+            }
+        }
+    }
+#endif
+
+    int nc[m];
+    gsl_vector *B[m];
+    size_t is[m]; // first non-zero spline
+    size_t ie[m]; // last non-zero spline
+    for (int j=0; j<m; j++) {
+        nc[j] = bw[j]->n;
+        B[j] = gsl_vector_alloc(4);
+    }
+
+    // Bookkeeping for the dynamic nested loop of depth m, shared by all points
+    const int max = 4; // upper bound of each nested loop
+    int *slots = (int *) malloc(sizeof(int) * m); // m indices in range(0, 4)
+    double *b_prod_hierarchy = (double *) malloc(sizeof(double) * (m+1));
+    int *i_sum_hierarchy = (int *) malloc(sizeof(int) * (m+1));
+
+    for (int pt=0; pt<M; pt++) {
+        const double *Xp = X + (size_t)pt * m;
+
+        // Evaluate the 4 nonzero cubic B-spline basis functions per dimension
+        for (int j=0; j<m; j++)
+            gsl_bspline_eval_nonzero(Xp[j], B[j], &is[j], &ie[j], bw[j]);
+
+        double sum = 0;
+
+        // Initialize the indices and current bspline products
+        int idx_sum = 0;
+        double product = 1;
+        b_prod_hierarchy[0] = 1;
+        i_sum_hierarchy[0] = 0;
+        for (int i = 0; i < m; i++) {
+            slots[i] = 0;
+            product *= gsl_vector_get(B[i], 0);
+            b_prod_hierarchy[i+1] = product;
+            idx_sum = idx_sum * nc[i] + is[i];
+            i_sum_hierarchy[i+1] = idx_sum;
+        }
+
+        // Loop over last index first, loop over first index last.
+        int index;
+
+        while (true) {
+            // Add the current coefficient times the product of all current bsplines
+            sum += v[ i_sum_hierarchy[m] ] * b_prod_hierarchy[m];
+
+            // Update the slots to the next valid configuration
+            slots[m-1]++;
+            index = m-1;
+            while (slots[index] == max) {
+                // Overflow, this point is done
+                if (index == 0)
+                    goto point_done;
+
+                slots[index--] = 0;
+                slots[index]++;
+            }
+
+            // Now update the index sums and bspline products for anything that was altered
+            while (index < m) {
+                b_prod_hierarchy[index+1] = b_prod_hierarchy[index] * gsl_vector_get(B[index], slots[index]);
+                i_sum_hierarchy[index+1] = i_sum_hierarchy[index] * nc[index] + is[index] + slots[index];
+                index++;
+            }
+        }
+
+        point_done:
+        y[pt] = sum;
+    }
+
+    for (int j=0; j<m; j++)
+        gsl_vector_free(B[j]);
+    free(slots);
+    free(b_prod_hierarchy);
+    free(i_sum_hierarchy);
+
+    return TPI_SUCCESS;
+}
+
+int TP_Interpolation_ND_Vector_Batch(
+    double *v,                    // Input: flattened TP spline coefficient array with
+                                  // p contiguous components per grid coefficient
+    int n,                        // Input: length of TP spline coefficient array v
+    double* X,                    // Input: M parameter space points, M x m row-major
+    int M,                        // Input: number of evaluation points
+    int m,                        // Input: dimensionality of parameter space
+    int p,                        // Input: number of value components per grid point
+    gsl_bspline_workspace **bw,   // Input: array of pointers to B-spline workspaces
+    double *y,                    // Output: TP spline evaluated at the M points, M x p row-major
+    int *fail_point,              // Output: on TPI_FAIL, index of first out-of-range point
+    int *fail_axis                // Output: on TPI_FAIL, axis of the range violation
+) {
+// Batched variant of TP_Interpolation_ND_Vector: shares the hoisted workspace
+// allocations across the M points, and per point shares the span search and
+// B-spline basis products across all p value components.
+
+#ifdef CHECK_RANGES
+    // Validate all points before evaluating anything so that on failure no
+    // partial output is written. The first offending point in batch order is
+    // reported through fail_point/fail_axis.
+    for (int i=0; i<M; i++) {
+        const double *Xp = X + (size_t)i*m;
+        for (int j=0; j<m; j++) {
+            gsl_vector* knots = bw[j]->knots;
+            double x_min = gsl_vector_get(knots, 0);
+            double x_max = gsl_vector_get(knots, knots->size - 1);
+            if (Xp[j] < x_min || Xp[j] > x_max) {
+                *fail_point = i;
+                *fail_axis = j;
+                return TPI_FAIL;
+            }
+        }
+    }
+#endif
+
+    int nc[m];
+    gsl_vector *B[m];
+    size_t is[m]; // first non-zero spline
+    size_t ie[m]; // last non-zero spline
+    for (int j=0; j<m; j++) {
+        nc[j] = bw[j]->n;
+        B[j] = gsl_vector_alloc(4);
+    }
+
+    // Bookkeeping for the dynamic nested loop of depth m, shared by all points
+    const int max = 4; // upper bound of each nested loop
+    int *slots = (int *) malloc(sizeof(int) * m); // m indices in range(0, 4)
+    double *b_prod_hierarchy = (double *) malloc(sizeof(double) * (m+1));
+    int *i_sum_hierarchy = (int *) malloc(sizeof(int) * (m+1));
+
+    for (int pt=0; pt<M; pt++) {
+        const double *Xp = X + (size_t)pt * m;
+        double *yp = y + (size_t)pt * p;
+
+        // Evaluate the 4 nonzero cubic B-spline basis functions per dimension
+        for (int j=0; j<m; j++)
+            gsl_bspline_eval_nonzero(Xp[j], B[j], &is[j], &ie[j], bw[j]);
+
+        // Accumulate all p components of the TP spline interpolant
+        for (int k=0; k<p; k++)
+            yp[k] = 0;
+
+        // Initialize the indices and current bspline products
+        int idx_sum = 0;
+        double product = 1;
+        b_prod_hierarchy[0] = 1;
+        i_sum_hierarchy[0] = 0;
+        for (int i = 0; i < m; i++) {
+            slots[i] = 0;
+            product *= gsl_vector_get(B[i], 0);
+            b_prod_hierarchy[i+1] = product;
+            idx_sum = idx_sum * nc[i] + is[i];
+            i_sum_hierarchy[i+1] = idx_sum;
+        }
+
+        // Loop over last index first, loop over first index last.
+        int index;
+
+        while (true) {
+            // Add the current coefficient block times the product of all current bsplines
+            const double b_prod = b_prod_hierarchy[m];
+            const double *vp = v + (size_t)i_sum_hierarchy[m] * p;
+            for (int k=0; k<p; k++)
+                yp[k] += vp[k] * b_prod;
+
+            // Update the slots to the next valid configuration
+            slots[m-1]++;
+            index = m-1;
+            while (slots[index] == max) {
+                // Overflow, this point is done
+                if (index == 0)
+                    goto point_done;
+
+                slots[index--] = 0;
+                slots[index]++;
+            }
+
+            // Now update the index sums and bspline products for anything that was altered
+            while (index < m) {
+                b_prod_hierarchy[index+1] = b_prod_hierarchy[index] * gsl_vector_get(B[index], slots[index]);
+                i_sum_hierarchy[index+1] = i_sum_hierarchy[index] * nc[index] + is[index] + slots[index];
+                index++;
+            }
+        }
+
+        point_done:
+        ;
+    }
+
+    for (int j=0; j<m; j++)
+        gsl_vector_free(B[j]);
+    free(slots);
+    free(b_prod_hierarchy);
+    free(i_sum_hierarchy);
+
+    return TPI_SUCCESS;
+}
+
 int TP_Interpolation_N_slowD(
     double *v,                    // Input: flattened TP spline coefficient array
     int n,                        // Input: length of TP spline coefficient array v
