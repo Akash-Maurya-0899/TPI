@@ -10,7 +10,7 @@
 #  2. **Saving minimal spline data** and reconstructing the spline later.
 #  3. **Evaluating splines** — single points, batches, and, on the JAX side,
 #     how `jit`, `vmap`, and `grad` change the game.
-#  4. **Vector/tensor-valued interpolation** (JAX backend), including how to
+#  4. **Vector/tensor-valued interpolation** (both backends), including how to
 #     combine previously saved per-component splines into one vectorized spline.
 #  5. **Benchmarks** for construction and evaluation, with plain-language
 #     explanations of what each number actually measures.
@@ -294,22 +294,25 @@ batch_grads = jax.vmap(jax.grad(fI_jax.TPInterpolationND))(pts_dev[:5])
 print("batched gradients shape:", np.asarray(batch_grads).shape)
 
 # %% [markdown]
-# ## 4. Vector- and tensor-valued interpolation (JAX backend)
+# ## 4. Vector- and tensor-valued interpolation (both backends)
 #
 # Often you interpolate several quantities on the *same grid* — components of
 # a vector field, a waveform's amplitude and phase, a tensor of couplings.
 # Building one scalar interpolant per component works but repeats the span
 # search and basis computation M times per evaluation.
 #
-# `TP_Interpolant_ND_Vector` interpolates all components at once. You give it
-# a `values_shape` — the shape of your function's *output* — and grid data `F`
-# with those value axes trailing the grid axes. All components share the
-# grid, knots, and factored spline matrices; the coefficient solve treats the
-# value axes as extra right-hand sides, and evaluation returns an array of
-# shape `values_shape`.
+# `TP_Interpolant_ND_Vector` interpolates all components at once, and exists
+# in **both backends** with the same constructor. You give it a `values_shape`
+# — the shape of your function's *output* — and grid data `F` with those value
+# axes trailing the grid axes. All components share the grid, knots, and
+# spline matrices; the coefficient solve treats the value axes as extra
+# right-hand sides, and evaluation returns an array of shape `values_shape`.
 #
-# (The Cython backend has no equivalent; there you keep a list of scalar
-# interpolants and loop over components.)
+# In the Cython/GSL backend the span search and the products of B-spline basis
+# functions are computed once per evaluation point in C and shared by all
+# components — only the final coefficient accumulation scales with M, so a
+# vector evaluation costs barely more than a *single* scalar one (see the
+# benchmarks in section 5.5).
 
 # %%
 def g1(x, y, z):
@@ -324,14 +327,18 @@ def g3(x, y, z):
 F_vec = np.stack([g(xx, yy, zz) for g in (g1, g2, g3)], axis=-1)
 print("vector-valued grid data shape:", F_vec.shape, "= grid shape + (3,)")
 
+fI_vec_gsl = TPI.TP_Interpolant_ND_Vector(nodes, values_shape=(3,), F=F_vec)
 fI_vec = TPI_jax.TP_Interpolant_ND_Vector(nodes, values_shape=(3,), F=F_vec)
 
 value = np.asarray(fI_vec.TPInterpolationND(point))
-print("vector value at point:   ", value)
-print("component-wise reference:", np.array([g(*point) for g in (g1, g2, g3)]))
+print("GSL vector value at point:", fI_vec_gsl.TPInterpolationND(point))
+print("JAX vector value at point:", value)
+print("component-wise reference: ", np.array([g(*point) for g in (g1, g2, g3)]))
 
 # %% [markdown]
-# Everything from section 3 carries over — batching, jit, and differentiation.
+# Everything from section 3 carries over: with the GSL backend you evaluate
+# point by point from Python (each call now returning a length-3 vector); with
+# the JAX backend you additionally get batching, jit, and differentiation.
 # For a vector-valued function the derivative is a **Jacobian** (one gradient
 # row per output component), so use `jax.jacfwd` instead of `jax.grad`:
 
@@ -346,16 +353,18 @@ print(jac)
 # %% [markdown]
 # `values_shape` can be any shape, not just a vector — e.g. `(2, 3)` for a
 # matrix-valued function; evaluation then returns `(2, 3)` arrays and the
-# coefficients have shape `grid + (2, 3)`.
+# coefficients have shape `grid + (2, 3)`. This works in both backends.
 #
 # ### 4.1 Combining previously saved per-component splines
 #
 # If you already have spline data for each component — built and saved
 # separately over the years, but all on the same grid — you do **not** need to
 # recompute anything. `FromComponentSplines` stacks existing per-component
-# coefficients into one vector-valued interpolant. It accepts either raw
-# coefficient arrays or interpolant objects (from *either* backend — a handy
-# migration path from a pile of Cython splines to one JAX spline):
+# coefficients into one vector-valued interpolant. It exists on both backends'
+# `TP_Interpolant_ND_Vector` and accepts either raw coefficient arrays or
+# interpolant objects — from *either* backend, in any mix. So a pile of old
+# Cython splines can become one GSL vector spline, one JAX vector spline, or
+# both:
 
 # %%
 # Pretend these were built independently (here: one per component, GSL backend)
@@ -365,15 +374,19 @@ for g in (g1, g2, g3):
     gsl_components.append(comp)
 
 # Combine the existing splines -- no coefficient solve happens here.
+fI_combined_gsl = TPI.TP_Interpolant_ND_Vector.FromComponentSplines(nodes, gsl_components)
 fI_combined = TPI_jax.TP_Interpolant_ND_Vector.FromComponentSplines(nodes, gsl_components)
 
-print("combined value:      ", np.asarray(fI_combined.TPInterpolationND(point)))
+print("combined value (GSL):", fI_combined_gsl.TPInterpolationND(point))
+print("combined value (JAX):", np.asarray(fI_combined.TPInterpolationND(point)))
 print("difference vs F_vec: ",
       np.max(np.abs(np.asarray(fI_combined.TPInterpolationND(point)) - value)))
 
-# The minimal saved data for a vector spline is nodes + stacked coefficients:
+# The minimal saved data for a vector spline is nodes + stacked coefficients,
+# and it is backend-agnostic, exactly as in section 2:
 stacked = np.asarray(fI_combined.GetSplineCoefficientsND())
 print("stacked coefficients shape:", stacked.shape)
+fI_reloaded_gsl = TPI.TP_Interpolant_ND_Vector(nodes, values_shape=(3,), coeffs=stacked)
 fI_reloaded = TPI_jax.TP_Interpolant_ND_Vector(nodes, values_shape=(3,), coeffs=stacked)
 
 # %% [markdown]
@@ -548,17 +561,51 @@ print(f"  JAX vmap(grad) batch      {grad_batch:9.3f} ms  (exact)")
 # ### 5.5 Vector-valued evaluation
 #
 # **What this measures:** the saving from interpolating M components in one
-# interpolant instead of M scalar interpolants. The span search and basis
-# computation are shared; only the final coefficient contraction scales with M.
+# interpolant instead of M scalar interpolants. In both backends the span
+# search and basis computation are shared; only the final coefficient
+# accumulation scales with M.
 
 # %%
+gsl_scalar_components = [
+    TPI.TP_Interpolant_ND(nodes, F=g(xx, yy, zz)) for g in (g1, g2, g3)
+]
+gsl_vec_single = median_ms(fI_vec_gsl.TPInterpolationND, point, repeat=100)
+gsl_scalar_x3 = median_ms(
+    lambda p: [comp.TPInterpolationND(p) for comp in gsl_scalar_components], point, repeat=100
+)
+
 vec_warmup = once_ms(fI_vec.TPInterpolationND, point)
 vec_single = median_ms(fI_vec.TPInterpolationND, point, repeat=100)
 scalar_x3 = 3 * jax_single
 
-print("3-component vector spline, 3D:")
-print(f"  1 vector eval             {vec_single*1e3:9.2f} us")
-print(f"  3 scalar evals            {scalar_x3*1e3:9.2f} us")
+print("3-component vector spline, 3D, single point from Python:")
+print(f"  GSL 1 vector eval         {gsl_vec_single*1e3:9.2f} us")
+print(f"  GSL 3 scalar evals        {gsl_scalar_x3*1e3:9.2f} us")
+print(f"  JAX 1 vector eval         {vec_single*1e3:9.2f} us")
+print(f"  JAX 3 scalar evals        {scalar_x3*1e3:9.2f} us")
+
+# %% [markdown]
+# The GSL vector evaluation costs barely more than a *single* scalar call —
+# the per-point bookkeeping dominates and is paid once. The saving grows with
+# the number of components: below, the same comparison with a 100-component
+# spline on the same grid.
+
+# %%
+ncomp = 100
+F_many = np.stack([np.sin((k + 1) * xx) * np.exp(yy) + zz for k in range(ncomp)], axis=-1)
+fI_many_gsl = TPI.TP_Interpolant_ND_Vector(nodes, values_shape=(ncomp,), F=F_many)
+many_scalars_gsl = [
+    TPI.TP_Interpolant_ND(nodes, F=np.ascontiguousarray(F_many[..., k])) for k in range(ncomp)
+]
+
+gsl_vec100 = median_ms(fI_many_gsl.TPInterpolationND, point, repeat=100)
+gsl_scalar_x100 = median_ms(
+    lambda p: [comp.TPInterpolationND(p) for comp in many_scalars_gsl], point, repeat=30
+)
+print(f"100-component vector spline, 3D (GSL):")
+print(f"  1 vector eval             {gsl_vec100*1e3:9.2f} us")
+print(f"  100 scalar evals          {gsl_scalar_x100*1e3:9.2f} us")
+print(f"  speedup                   {gsl_scalar_x100/gsl_vec100:9.1f}x")
 
 # %% [markdown]
 # ### 5.6 Takeaways
@@ -575,7 +622,9 @@ print(f"  3 scalar evals            {scalar_x3*1e3:9.2f} us")
 #    short-lived and calls the spline only a few times, that warmup may
 #    dominate; long-running analyses amortize it to nothing.
 #  * **Vector-valued splines** share all per-point bookkeeping across
-#    components — prefer one vector interpolant over M scalar ones.
+#    components — prefer one vector interpolant over M scalar ones, in either
+#    backend. For one-at-a-time vector values from Python, the GSL
+#    `TP_Interpolant_ND_Vector` is the fastest option by a wide margin.
 
 # %% [markdown]
 # ## Quick reference
@@ -595,8 +644,11 @@ print(f"  3 scalar evals            {scalar_x3*1e3:9.2f} us")
 # g  = jax.grad(fI.TPInterpolationND)(x)          # dI/dx            [JAX]
 # ys = jax.vmap(fI.TPInterpolationND)(xs)         # inside your own jit/vmap
 #
-# # --- vector/tensor-valued (JAX) ---
-# fV = TPI_jax.TP_Interpolant_ND_Vector(nodes, values_shape=(M,), F=F_vec)
+# # --- vector/tensor-valued (both backends) ---
+# fV = TPI.TP_Interpolant_ND_Vector(nodes, values_shape=(M,), F=F_vec)      # Cython/GSL
+# fV = TPI_jax.TP_Interpolant_ND_Vector(nodes, values_shape=(M,), F=F_vec)  # JAX
+# fV = TPI.TP_Interpolant_ND_Vector.FromComponentSplines(nodes, [fI_1, ..., fI_M])
 # fV = TPI_jax.TP_Interpolant_ND_Vector.FromComponentSplines(nodes, [fI_1, ..., fI_M])
-# J  = jax.jacfwd(fV.TPInterpolationND)(x)        # Jacobian, shape (M, N)
+# v  = fV(x)                                      # shape (M,), either backend
+# J  = jax.jacfwd(fV.TPInterpolationND)(x)        # Jacobian, shape (M, N)   [JAX]
 # ```
