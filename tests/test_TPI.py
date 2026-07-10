@@ -2404,6 +2404,53 @@ def test_gsl_vector_ComputeSplineCoefficientsND_matches_dense_reference():
     assert np.allclose(actual, expected, atol=1e-10, rtol=0)
 
 
+def test_banded_notaknot_boundary_rows_match_gsl():
+    """TPI_banded's NumPy boundary rows must match the GSL dense matrix rows."""
+    import TPI_banded
+
+    grids = [
+        np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25]),
+        np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0]),
+        np.array([-0.8, -0.6, -0.4, 0.0, 0.5, 1.0, 1.5]),
+        np.sort(np.random.default_rng(42).uniform(0.0, 10.0, 30)),
+    ]
+    for x in grids:
+        A, _ = TPI.BsplineBasis1D(x).AssembleSplineMatrix()
+        row_first, row_last = TPI_banded.notaknot_boundary_rows(x)
+        actual = np.stack((row_first, row_last))
+        expected = np.stack((A[0], A[-1]))
+        print(f"n={len(x)}")
+        _print_coefficient_diffs(actual, expected)
+        # 3rd-derivative rows scale like 1/h^3 (up to ~1e9 on fine grids), so
+        # agreement is asserted relative to the entry magnitude.
+        assert np.allclose(actual, expected, rtol=1e-12, atol=1e-10)
+
+
+def test_jax_ComputeSplineCoefficientsND_large_1d_grid():
+    """JAX setup and coefficient solve on a 200k-point 1D grid must be O(n) memory.
+
+    Before the banded solve, TPInterpolationSetupND dense-LU-factored the
+    (n+2)^2 spline matrix, which attempted a ~320 GB allocation here.
+    """
+    from scipy.interpolate import CubicSpline
+
+    rng = np.random.default_rng(42)
+    n = 200_000
+    x = np.sort(rng.uniform(0.0, 100.0, n))
+    x[0] = 0.0
+    x[-1] = 100.0
+    F = np.sin(x) * np.exp(-0.01 * x)
+
+    TPint = TPI_jax.TP_Interpolant_ND([x], F=F)
+
+    xq = np.sort(rng.uniform(0.0, 100.0, 30))
+    actual = np.asarray(TPint.TPInterpolationND_batched(xq[:, None]))
+    expected = CubicSpline(x, F, bc_type="not-a-knot")(xq)
+
+    _print_coefficient_diffs(actual, expected)
+    assert np.allclose(actual, expected, atol=1e-10, rtol=0)
+
+
 def test_gsl_ComputeSplineCoefficientsND_large_1d_grid():
     """A 200k-point 1D grid must not assemble dense (n+2)^2 matrices.
 

@@ -10,11 +10,12 @@ import numpy as np
 
 import jax
 from jax import core as jax_core
-import jax.scipy.linalg as jax_linalg
 
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
+
+import TPI_banded
 
 
 def _as_valid_nodes(nodes):
@@ -284,39 +285,31 @@ def _assemble_spline_matrix_jax(nodes):
     return phi, knots
 
 
-@jax.jit
-def _factor_spline_matrix_jax(nodes):
-    """Factor the cubic spline matrix for a validated 1D node array.
-
-    jit-compiled for the same reason as _assemble_spline_matrix_jax: setup on
-    a previously seen axis length is a compilation-cache hit.
-    """
-    phi, _ = _assemble_spline_matrix_jax(nodes)
-    return jax_linalg.lu_factor(phi)
+def _banded_spline_factors(nodes):
+    """Banded collocation matrices for concrete node arrays, host-side."""
+    return tuple(
+        TPI_banded.assemble_spline_matrix_banded(np.asarray(node, dtype=np.float64))
+        for node in nodes
+    )
 
 
-def _solve_axis_system(matrix, tensor, axis):
-    rhs = jnp.moveaxis(tensor, axis, 0)
-    leading = rhs.shape[0]
-    solved = jnp.linalg.solve(matrix, rhs.reshape((leading, -1)))
-    solved = solved.reshape(rhs.shape)
-    return jnp.moveaxis(solved, 0, axis)
-
-
-def _solve_axis_system_from_lu(lu_and_piv, tensor, axis):
-    rhs = jnp.moveaxis(tensor, axis, 0)
-    leading = rhs.shape[0]
-    solved = jax_linalg.lu_solve(lu_and_piv, rhs.reshape((leading, -1)))
-    solved = solved.reshape(rhs.shape)
-    return jnp.moveaxis(solved, 0, axis)
+def _banded_solve_host(factors, F_np, ngrid, values_ndim):
+    """Pad the grid axes and run the banded solve along each grid axis."""
+    coeffs = np.pad(F_np, [(1, 1)] * ngrid + [(0, 0)] * values_ndim, mode="constant")
+    for axis in range(ngrid - 1, -1, -1):
+        coeffs = TPI_banded.solve_banded_axis(factors[axis], coeffs, axis)
+    return coeffs
 
 
 def _compute_spline_coefficients_nd(nodes, F, spline_matrix_factors=None, values_shape=()):
     """Compute tensor-product spline coefficients for validated nodes and data.
 
-    The implementation performs sequential 1D solves along each axis. On grids with
-    high spline-matrix condition numbers, tiny differences in assembled matrices or
-    floating-point ordering can be amplified into larger coefficient differences.
+    The implementation performs sequential banded 1D solves along each axis
+    (the collocation matrix has bandwidths (4, 4)), in O(n) memory and time
+    per axis instead of the O(n^2)/O(n^3) of a dense factorization. The solve
+    runs host-side via scipy; traced inputs (e.g. under jit) are routed
+    through jax.pure_callback with identical numerics. The callback path is
+    not differentiable w.r.t. F -- coefficient autodiff is out of scope.
 
     For vector/tensor-valued data, F carries trailing value axes of shape
     values_shape. The 1D solves only run over the grid axes; value axes ride
@@ -330,12 +323,31 @@ def _compute_spline_coefficients_nd(nodes, F, spline_matrix_factors=None, values
     if F.shape != dims + values_shape:
         raise ValueError(f"Data on TP grid should have shape {list(dims + values_shape)}")
 
-    coeffs = jnp.pad(F, [(1, 1)] * len(nodes) + [(0, 0)] * len(values_shape), mode="constant")
-    if spline_matrix_factors is None:
-        spline_matrix_factors = tuple(_factor_spline_matrix_jax(node) for node in nodes)
-    for axis in range(len(nodes) - 1, -1, -1):
-        coeffs = _solve_axis_system_from_lu(spline_matrix_factors[axis], coeffs, axis)
-    return coeffs
+    ngrid = len(nodes)
+    values_ndim = len(values_shape)
+
+    if not any(isinstance(arr, jax_core.Tracer) for arr in nodes + (F,)):
+        if spline_matrix_factors is None:
+            spline_matrix_factors = _banded_spline_factors(nodes)
+        coeffs = _banded_solve_host(spline_matrix_factors, np.asarray(F), ngrid, values_ndim)
+        return jnp.asarray(coeffs)
+
+    factors = spline_matrix_factors
+
+    def _callback(*args):
+        nodes_np = [np.asarray(node, dtype=np.float64) for node in args[:-1]]
+        F_np = np.asarray(args[-1], dtype=np.float64)
+        cb_factors = factors if factors is not None else _banded_spline_factors(nodes_np)
+        return _banded_solve_host(cb_factors, F_np, ngrid, values_ndim)
+
+    out_shape = tuple(dim + 2 for dim in dims) + values_shape
+    return jax.pure_callback(
+        _callback,
+        jax.ShapeDtypeStruct(out_shape, jnp.float64),
+        *nodes,
+        F,
+        vmap_method="sequential",
+    )
 
 
 def compute_spline_coefficients_nd(nodes, F):
@@ -390,7 +402,7 @@ class TP_Interpolant_ND:
     def TPInterpolationSetupND(self):
         self.bases = tuple(BsplineBasis1D(np.asarray(node)) for node in self.nodes)
         self.knots_list = tuple(base.knots for base in self.bases)
-        self.spline_matrix_factors = tuple(_factor_spline_matrix_jax(node) for node in self.nodes)
+        self.spline_matrix_factors = _banded_spline_factors(self.nodes)
         # Domain bounds cached host-side: reading node endpoints per evaluation
         # would force a device sync on every call.
         self._lows = np.array([base._x_min for base in self.bases], dtype=np.float64)

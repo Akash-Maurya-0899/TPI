@@ -87,6 +87,88 @@ def active_basis_at_nodes(nodes):
     return basis4, spans - 3
 
 
+def _cubic_bspline_3rd_derivs_active(knots, x):
+    """3rd derivatives of the 4 active cubic B-splines at scalar x.
+
+    Standard derivative recurrence (The NURBS Book, DersBasisFuns) at degree 3,
+    matching the GSL and JAX-backend conventions. Returns (values, start) where
+    values are the 3rd derivatives of basis functions start..start+3.
+    """
+    p = 3
+    span = int(np.searchsorted(knots[3:-3], x, side="right")) + 2
+    span = min(max(span, 3), len(knots) - 5)
+
+    ndu = np.zeros((p + 1, p + 1))
+    ndu[0, 0] = 1.0
+    left = np.zeros(p + 1)
+    right = np.zeros(p + 1)
+    for j in range(1, p + 1):
+        left[j] = x - knots[span + 1 - j]
+        right[j] = knots[span + j] - x
+        saved = 0.0
+        for r in range(j):
+            ndu[j, r] = right[r + 1] + left[j - r]
+            temp = ndu[r, j - 1] / ndu[j, r] if ndu[j, r] != 0.0 else 0.0
+            ndu[r, j] = saved + right[r + 1] * temp
+            saved = left[j - r] * temp
+        ndu[j, j] = saved
+
+    ders3 = np.zeros(p + 1)
+    for r in range(p + 1):
+        a = np.zeros((2, p + 1))
+        a[0, 0] = 1.0
+        s1, s2 = 0, 1
+        d = 0.0
+        for k in range(1, p + 1):
+            d = 0.0
+            rk = r - k
+            pk = p - k
+            if r >= k:
+                a[s2, 0] = a[s1, 0] / ndu[pk + 1, rk] if ndu[pk + 1, rk] != 0.0 else 0.0
+                d = a[s2, 0] * ndu[rk, pk]
+            j1 = 1 if rk >= -1 else -rk
+            j2 = k - 1 if (r - 1) <= pk else p - r
+            for j in range(j1, j2 + 1):
+                denom = ndu[pk + 1, rk + j]
+                a[s2, j] = (a[s1, j] - a[s1, j - 1]) / denom if denom != 0.0 else 0.0
+                d += a[s2, j] * ndu[rk + j, pk]
+            if r <= pk:
+                a[s2, k] = -a[s1, k - 1] / ndu[pk + 1, r] if ndu[pk + 1, r] != 0.0 else 0.0
+                d += a[s2, k] * ndu[r, pk]
+            s1, s2 = s2, s1
+        ders3[r] = d
+    # p! / (p - 3)! scaling for the 3rd derivative
+    return ders3 * 6.0, span - 3
+
+
+def notaknot_boundary_rows(nodes):
+    """The two not-a-knot rows of the collocation matrix (full length n + 2).
+
+    Row 0 and row n+1: differences of 3rd-derivative basis values at the
+    midpoints of the first/last two intervals, imposing 3rd-derivative
+    continuity across the 2nd and penultimate nodes.
+    """
+    nodes = np.asarray(nodes, dtype=np.float64)
+    knots = construct_knots(nodes)
+    N = nodes.shape[0] + 2
+
+    def full_row(x):
+        values, start = _cubic_bspline_3rd_derivs_active(knots, x)
+        row = np.zeros(N)
+        row[start:start + 4] = values
+        return row
+
+    row_first = full_row(0.5 * (nodes[0] + nodes[1])) - full_row(0.5 * (nodes[1] + nodes[2]))
+    row_last = full_row(0.5 * (nodes[-3] + nodes[-2])) - full_row(0.5 * (nodes[-2] + nodes[-1]))
+    return row_first, row_last
+
+
+def assemble_spline_matrix_banded(nodes):
+    """Banded not-a-knot collocation matrix with self-contained boundary rows."""
+    row_first, row_last = notaknot_boundary_rows(nodes)
+    return assemble_banded_ab(nodes, row_first, row_last)
+
+
 def assemble_banded_ab(nodes, row_first, row_last):
     """Assemble the not-a-knot collocation matrix in LAPACK banded storage.
 
