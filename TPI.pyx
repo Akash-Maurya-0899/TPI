@@ -23,6 +23,8 @@
 import numpy as np
 cimport numpy as np
 
+import TPI_banded
+
 from libc.stdlib cimport malloc, free
 from cpython.mem cimport PyMem_Malloc, PyMem_Free
 
@@ -335,25 +337,31 @@ cdef class TP_Interpolant_ND:
         if not np.shape(F) == tuple(dims):
             raise ValueError("Data on TP grid should have shape {}".format(dims))
 
-        # Compute 1D spline matrices and knot vectors
-        inv_1d_matrices = []
+        # Assemble the 1D spline matrices in banded storage; the dense
+        # (n+2)^2 assembly with an explicit inverse needs O(n^2) memory and
+        # O(n^3) time per axis, the banded form O(n) for both.
+        banded_matrices = []
         knots_list = []
         cdef unsigned int i
         for i in range(d):
-            b = BsplineBasis1D(nodesND[i])
-            A, knots = b.AssembleSplineMatrix()
-            Ainv = np.linalg.inv(A)
-            inv_1d_matrices.append(Ainv)
-            knots_list.append(knots)
+            xi = nodesND[i]
+            b = BsplineBasis1D(xi)
+            r1 = b.EvaluateBsplines3rdDerivatives((xi[0] + xi[1]) / 2.) \
+               - b.EvaluateBsplines3rdDerivatives((xi[1] + xi[2]) / 2.)
+            rm1 = b.EvaluateBsplines3rdDerivatives((xi[-3] + xi[-2]) / 2.) \
+                - b.EvaluateBsplines3rdDerivatives((xi[-2] + xi[-1]) / 2.)
+            banded_matrices.append(TPI_banded.assemble_banded_ab(xi, r1, rm1))
+            knots_list.append(TPI_banded.construct_knots(xi))
         self.knots_list = knots_list
 
         # pad boundaries with zeroes since we have 2 more equations with the not-a-knot conditions than data
         F0 = np.pad(F, 1, 'constant')
 
-        # Solve a sequence of linear systems to obtain coefficient tensor
+        # Solve a sequence of banded linear systems along each axis to obtain
+        # the coefficient tensor; solve_banded_axis preserves the axis order.
         tmp_result = F0
-        for minv in inv_1d_matrices[::-1]:
-            tmp_result = np.tensordot(minv, tmp_result, (1, d - 1))
+        for axis in range(d - 1, -1, -1):
+            tmp_result = TPI_banded.solve_banded_axis(banded_matrices[axis], tmp_result, axis)
         self.c = tmp_result
         # ravel() is a no-copy view here since tmp_result is a fresh contiguous array
         self.c_flat = np.ascontiguousarray(tmp_result, dtype=np.double).ravel()
@@ -501,28 +509,32 @@ cdef class TP_Interpolant_ND_Vector(TP_Interpolant_ND):
                 "Data on TP grid should have shape {}".format(list(dims) + list(values_shape))
             )
 
-        # Compute 1D spline matrices and knot vectors
-        inv_1d_matrices = []
+        # Assemble the 1D spline matrices in banded storage; see the scalar
+        # class for the memory rationale.
+        banded_matrices = []
         knots_list = []
         cdef unsigned int i
         for i in range(d):
-            b = BsplineBasis1D(nodesND[i])
-            A, knots = b.AssembleSplineMatrix()
-            Ainv = np.linalg.inv(A)
-            inv_1d_matrices.append(Ainv)
-            knots_list.append(knots)
+            xi = nodesND[i]
+            b = BsplineBasis1D(xi)
+            r1 = b.EvaluateBsplines3rdDerivatives((xi[0] + xi[1]) / 2.) \
+               - b.EvaluateBsplines3rdDerivatives((xi[1] + xi[2]) / 2.)
+            rm1 = b.EvaluateBsplines3rdDerivatives((xi[-3] + xi[-2]) / 2.) \
+                - b.EvaluateBsplines3rdDerivatives((xi[-2] + xi[-1]) / 2.)
+            banded_matrices.append(TPI_banded.assemble_banded_ab(xi, r1, rm1))
+            knots_list.append(TPI_banded.construct_knots(xi))
         self.knots_list = knots_list
 
         # pad only the grid axes with zeroes (2 more equations per grid axis with
         # the not-a-knot conditions); value axes ride along as extra right-hand sides
         F0 = np.pad(F, [(1, 1)] * d + [(0, 0)] * len(values_shape), 'constant')
 
-        # Solve a sequence of linear systems to obtain the coefficient tensor.
-        # Contracting axis d-1 always targets the last unsolved grid axis because
-        # tensordot moves the solved axis to the front and the value axes stay trailing.
+        # Solve a sequence of banded linear systems along the grid axes;
+        # solve_banded_axis preserves axis order and the value axes ride
+        # along as extra right-hand sides.
         tmp_result = F0
-        for minv in inv_1d_matrices[::-1]:
-            tmp_result = np.tensordot(minv, tmp_result, (1, d - 1))
+        for axis in range(d - 1, -1, -1):
+            tmp_result = TPI_banded.solve_banded_axis(banded_matrices[axis], tmp_result, axis)
         self.c = tmp_result
         # ravel() is a no-copy view here since tmp_result is a fresh contiguous array
         self.c_flat = np.ascontiguousarray(tmp_result, dtype=np.double).ravel()

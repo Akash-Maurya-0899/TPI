@@ -18,42 +18,21 @@
 #  along with TPI.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-from __future__  import print_function
-
 import numpy
-from distutils.core import setup
-from distutils.extension import Extension
-
-try:
-    from Cython.Build import cythonize
-    print('Using Cython')
-    USE_CYTHON = True
-except:
-    print('Not using Cython')
-    USE_CYTHON = False
-
-
-from distutils.command.build_ext import build_ext
-def get_export_symbols_fixed(self, ext):
-    pass  # return [] also does the job!
-
-    # replace wrong version with the fixed:
-    build_ext.get_export_symbols = get_export_symbols_fixed
-
-
+from setuptools import setup
+from setuptools.extension import Extension
 
 VERSION = '1.0.1'
 
 NUMPY_DEP = 'numpy>=1.11'
+SCIPY_DEP = 'scipy>=1.0'
 
-SETUP_REQUIRES = [NUMPY_DEP]
+SETUP_REQUIRES = [NUMPY_DEP, SCIPY_DEP]
 
-
-ext = '.pyx' if USE_CYTHON else '.c'
 
 extensions=[
     Extension("TPI",
-              sources=["TPI"+ext, "TensorProductInterpolation.c"],
+              sources=["TPI.c", "TensorProductInterpolation.c"],
               include_dirs = [numpy.get_include()],
               language="c",
               extra_compile_args = ["-std=c99", "-O3"],
@@ -67,7 +46,7 @@ cls_txt = \
 Development Status :: 5 - Production/Stable
 Intended Audience :: Science/Research
 License :: OSI Approved :: GNU General Public License v3 (GPLv3)
-Programming Language :: Cython
+Programming Language :: C
 Programming Language :: Python
 Programming Language :: Python :: Implementation :: CPython
 Topic :: Scientific/Engineering
@@ -99,14 +78,10 @@ TP_Interpolant_ND:
     the interpolation problem can be separated, by writing the coefficient data to disk.
 """
 
-if USE_CYTHON:
-    from Cython.Build import cythonize
-    extensions = cythonize(extensions)
-
 setup(
     name="TPI",
     version=VERSION,
-    py_modules=["TPI_jax"],
+    py_modules=["TPI_jax", "TPI_banded"],
     ext_modules=extensions,
     author="Michael Pürrer, Jonathan Blackman",
     author_email="Michael.Puerrer@gmail.com",

@@ -1,7 +1,7 @@
 # pyproject.toml
 
 [build-system]
-requires = ["setuptools>=61.0.0", "wheel", "cython ~= 0.29.0", "numpy>=1.11"]
+requires = ["setuptools>=61.0.0", "wheel", "numpy>=1.11"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -15,7 +15,7 @@ classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
-    "Programming Language :: Cython",
+    "Programming Language :: C",
     "Programming Language :: Python",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
@@ -27,6 +27,7 @@ classifiers = [
 keywords = ["feed", "reader", "tutorial"]
 dependencies = [
     "numpy>=1.11",
+    "scipy>=1.0",
 ]
 requires-python = ">=3.0"
 

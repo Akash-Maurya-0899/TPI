@@ -2324,6 +2324,112 @@ def test_TP_spline_interpolation_7D():
         res = TPint.TPInterpolationND(Y)
 
 
+def _dense_reference_coefficients(nodes, F, values_ndim=0):
+    """Reference coefficient solve using the dense assembled spline matrices.
+
+    Solves axis-by-axis with np.linalg.solve on the full (n+2, n+2) matrices,
+    so it reproduces the pre-banded implementation up to solver roundoff.
+    """
+    d = len(nodes)
+    F0 = np.pad(F, [(1, 1)] * d + [(0, 0)] * values_ndim, "constant")
+    result = F0
+    for axis in range(d):
+        A, _ = TPI.BsplineBasis1D(nodes[axis]).AssembleSplineMatrix()
+        moved = np.moveaxis(result, axis, 0)
+        solved = np.linalg.solve(A, moved.reshape(moved.shape[0], -1))
+        result = np.moveaxis(solved.reshape(moved.shape), 0, axis)
+    return result
+
+
+def _print_coefficient_diffs(actual, expected):
+    abs_diff = np.abs(actual - expected).reshape(-1)
+    rel_den = np.maximum(np.abs(expected).reshape(-1), np.finfo(np.float64).tiny)
+    rel_diff = abs_diff / rel_den
+    max_abs_idx = int(np.argmax(abs_diff))
+    max_rel_idx = int(np.argmax(rel_diff))
+    max_abs_index = np.unravel_index(max_abs_idx, actual.shape)
+    max_rel_index = np.unravel_index(max_rel_idx, actual.shape)
+    print(f"max abs diff: {abs_diff[max_abs_idx]:.3e} at index={max_abs_index}")
+    print(f"max rel diff: {rel_diff[max_rel_idx]:.3e} at index={max_rel_index}")
+
+
+def _standard_grids_1d_to_4d():
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    zi = np.array([-1, -0.8, -0.6, -0.4, 0.0, 0.2, 0.4, 0.8, 1.0])
+    wi = np.array([-0.8, -0.6, -0.4, 0.0, 0.5, 1.0, 1.5])
+    functions = {
+        1: lambda x: np.cos(10.0 * x),
+        2: lambda x, y: np.sin(x) * np.arccos(y),
+        3: lambda x, y, z: np.sin(x) * np.arccos(y) * np.exp(z),
+        4: lambda x, y, z, w: np.sin(x) * np.arccos(y) * np.exp(z) * np.cos(w),
+    }
+    node_sets = {1: (xi,), 2: (xi, yi), 3: (xi, yi, zi), 4: (xi, yi, zi, wi)}
+    for dim, nodes in node_sets.items():
+        mesh = np.meshgrid(*nodes, indexing="ij")
+        F = np.asarray(functions[dim](*mesh), dtype=np.float64)
+        yield dim, list(nodes), F
+
+
+def test_gsl_ComputeSplineCoefficientsND_matches_dense_reference():
+    """Banded coefficient solve must match the dense-matrix solve for 1D-4D grids."""
+    for dim, nodes, F in _standard_grids_1d_to_4d():
+        TPint = TPI.TP_Interpolant_ND(nodes)
+        TPint.ComputeSplineCoefficientsND(F)
+        actual = np.asarray(TPint.GetSplineCoefficientsND())
+        expected = _dense_reference_coefficients(nodes, F)
+        assert actual.shape == expected.shape
+        print(f"dim={dim}")
+        _print_coefficient_diffs(actual, expected)
+        assert np.allclose(actual, expected, atol=1e-10, rtol=0)
+
+
+def test_gsl_vector_ComputeSplineCoefficientsND_matches_dense_reference():
+    """Vector-valued banded coefficient solve must match the dense-matrix solve."""
+    xi = np.array([0.1, 0.11, 0.12, 0.15, 0.2, 0.23, 0.24, 0.248, 0.249, 0.25])
+    yi = np.array([-1, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.0])
+    nodes = [xi, yi]
+    values_shape = (2, 3)
+    xx, yy = np.meshgrid(xi, yi, indexing="ij")
+    base = np.sin(xx) * np.arccos(yy)
+    scales = np.arange(1.0, 7.0).reshape(values_shape)
+    F = base[..., None, None] * scales
+
+    TPint = TPI.TP_Interpolant_ND_Vector(nodes, values_shape)
+    TPint.ComputeSplineCoefficientsND(F)
+    actual = np.asarray(TPint.GetSplineCoefficientsND())
+    expected = _dense_reference_coefficients(nodes, F, values_ndim=len(values_shape))
+    assert actual.shape == expected.shape
+    _print_coefficient_diffs(actual, expected)
+    assert np.allclose(actual, expected, atol=1e-10, rtol=0)
+
+
+def test_gsl_ComputeSplineCoefficientsND_large_1d_grid():
+    """A 200k-point 1D grid must not assemble dense (n+2)^2 matrices.
+
+    Before the banded solve this attempted a ~320 GB allocation; now the
+    whole solve is O(n) memory. Accuracy is checked against scipy's
+    not-a-knot cubic spline.
+    """
+    from scipy.interpolate import CubicSpline
+
+    rng = np.random.default_rng(42)
+    n = 200_000
+    x = np.sort(rng.uniform(0.0, 100.0, n))
+    x[0] = 0.0
+    x[-1] = 100.0
+    F = np.sin(x) * np.exp(-0.01 * x)
+
+    TPint = TPI.TP_Interpolant_ND([x], F=F)
+
+    xq = np.sort(rng.uniform(0.0, 100.0, 30))
+    actual = TPint.TPInterpolationND_batched(xq[:, None])
+    expected = CubicSpline(x, F, bc_type="not-a-knot")(xq)
+
+    _print_coefficient_diffs(actual, expected)
+    assert np.allclose(actual, expected, atol=1e-10, rtol=0)
+
+
 # Hack for running tests since pytest does not import the Cython module under python3
 # Just run: python3 test.py
 '''
