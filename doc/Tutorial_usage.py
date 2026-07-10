@@ -14,6 +14,10 @@
 #     combine previously saved per-component splines into one vectorized spline.
 #  5. **Benchmarks** for construction and evaluation, with plain-language
 #     explanations of what each number actually measures.
+#  6. **Large grids and the dedicated fast 1D path (`Spline1D`)** — the
+#     coefficient solve is banded (O(n) memory, hundreds of thousands of
+#     points are fine), and a specialized 1D class squeezes out the last
+#     factors for construction and sorted-batch evaluation.
 #
 # The file is written in jupytext "percent" format: every `# %%` marker is a
 # code cell and every `# %% [markdown]` marker is a markdown cell, so you can
@@ -151,7 +155,7 @@ print("spline matrix shape:", np.asarray(phi).shape, "| knots:", np.asarray(knot
 #  * the list of 1D node arrays (`nodes`), and
 #  * the coefficient tensor, of shape `tuple(len(n_i) + 2 for n_i in nodes)`.
 #
-# Everything else (knot vectors, spline matrices, LU factors, the compiled
+# Everything else (knot vectors, factored spline matrices, the compiled
 # evaluator) is deterministically rebuilt from the nodes. So "save the spline"
 # means: save the nodes and the coefficients. `GetSplineCoefficientsND()`
 # returns the coefficients; passing `coeffs=` to the constructor (or calling
@@ -671,6 +675,143 @@ print(f"  JAX vmap batch            {jax_vec_batch:9.3f} ms")
 #    components — prefer one vector interpolant over M scalar ones, in either
 #    backend. For one-at-a-time vector values from Python, the GSL
 #    `TP_Interpolant_ND_Vector` is the fastest option by a wide margin.
+#  * **Purely 1D problems:** use `Spline1D` (section 6) — fastest
+#    construction (tridiagonal solve, on-device in JAX) and fastest sorted
+#    batch evaluation (monotone C walk in the GSL backend).
+
+# %% [markdown]
+# ## 6. Large grids and the dedicated fast 1D path (`Spline1D`)
+#
+# ### 6.1 Large grids just work now
+#
+# The not-a-knot collocation matrix of each axis is banded (bandwidths 4/4),
+# and the coefficient solve now exploits that: assembly and solve are
+# **O(n) in memory and time** per axis (`scipy.linalg.solve_banded`; small
+# axes keep the historical dense-inverse behavior, which is faster for the
+# many right-hand sides of N-D grids). Previously the matrix was assembled
+# dense and inverted — a 1D spline on 500,000 points would have needed about
+# **2 TB** of memory; it now needs a few hundred MB of process total and
+# about a quarter of a second, in both backends and with unchanged results
+# (coefficients agree with the old solver to ~1e-13).
+#
+# Nothing about the API changes on large grids — construct
+# `TP_Interpolant_ND` exactly as before:
+
+# %%
+rng = np.random.default_rng(42)
+n_large = 200_000
+x_large = np.sort(rng.uniform(0.0, 100.0, n_large))
+x_large[0], x_large[-1] = 0.0, 100.0
+F_large = np.sin(x_large) * np.exp(-0.01 * x_large)
+
+t0 = time.perf_counter()
+fI_large = TPI.TP_Interpolant_ND([x_large], F=F_large)
+print(f"GSL general path, n={n_large}: {(time.perf_counter()-t0)*1e3:.0f} ms")
+
+t0 = time.perf_counter()
+fI_large_jax = TPI_jax.TP_Interpolant_ND([x_large], F=F_large)
+print(f"JAX general path, n={n_large}: {(time.perf_counter()-t0)*1e3:.0f} ms")
+
+# %% [markdown]
+# ### 6.2 `Spline1D`: the dedicated 1D class
+#
+# For purely 1D problems both backends additionally provide `Spline1D`,
+# which is substantially faster than the general machinery because it
+# exploits everything the 1D case offers:
+#
+#  * **Construction** solves the classic *tridiagonal* not-a-knot system for
+#    the node derivatives — no search anywhere, the sortedness of the node
+#    array is used to the fullest. In the JAX backend the solve is
+#    `jax.lax.linalg.tridiagonal_solve`, so construction is jit-compatible
+#    and runs **entirely on the JAX device (GPU-capable, no host callback)**.
+#  * **Evaluation** works directly on the native per-interval (Hermite)
+#    representation. The Cython backend evaluates *sorted* query batches with
+#    a monotone span walk in C — O(M + n) instead of O(M log n) — and falls
+#    back to a vectorized binary search for unsorted input. The JAX
+#    evaluator is jit/vmap-compatible and differentiable w.r.t. the query
+#    points.
+#
+# Requirements: strictly increasing nodes, at least 4 of them, scalar values.
+
+# %%
+s_gsl = TPI.Spline1D(x_large, F=F_large)
+s_jax = TPI_jax.Spline1D(x_large, F=F_large)
+
+xq_sorted = np.sort(rng.uniform(0.0, 100.0, 500_000))
+print("GSL Spline1D :", s_gsl(xq_sorted[:3]))
+print("JAX Spline1D :", np.asarray(s_jax(xq_sorted[:3])))
+print("general path :", fI_large.TPInterpolationND_batched(xq_sorted[:3, None]))
+
+# %% [markdown]
+# How much faster? Construction and a 500k-point sorted evaluation on the
+# 200k-node grid (medians; the first JAX call pays JIT compilation, see
+# section 5):
+
+# %%
+con_gsl_1d = median_ms(lambda: TPI.Spline1D(x_large, F=F_large), repeat=10)
+con_jax_1d = median_ms(lambda: TPI_jax.Spline1D(x_large, F=F_large).poly, repeat=10)
+con_gsl_gen = median_ms(lambda: TPI.TP_Interpolant_ND([x_large], F=F_large), repeat=10)
+
+ev_gsl_1d = median_ms(s_gsl, xq_sorted, repeat=10)
+ev_jax_1d = median_ms(s_jax, xq_sorted, repeat=10)
+# The general path costs tens of microseconds *per point* on grids this
+# large, so it is timed on a 20k subset and scaled to the full batch size.
+subset = xq_sorted[::25][:, None]
+ev_gsl_gen = median_ms(fI_large.TPInterpolationND_batched, subset, repeat=3)
+ev_gsl_gen_scaled = ev_gsl_gen * (len(xq_sorted) / len(subset))
+
+print(f"construction n={n_large}:")
+print(f"  Spline1D GSL {con_gsl_1d:8.1f} ms | Spline1D JAX {con_jax_1d:8.1f} ms "
+      f"| general GSL {con_gsl_gen:8.1f} ms")
+print(f"evaluation of {len(xq_sorted)} sorted points:")
+print(f"  Spline1D GSL {ev_gsl_1d:8.1f} ms | Spline1D JAX {ev_jax_1d:8.1f} ms "
+      f"| general GSL batched ~{ev_gsl_gen_scaled:8.0f} ms (scaled from 20k points)")
+
+# %% [markdown]
+# Accuracy is identical to the general path (same spline, different — and on
+# pathological grids equally stable — factorization):
+
+# %%
+check = xq_sorted[::25]
+diff = np.abs(s_gsl(check) - fI_large.TPInterpolationND_batched(check[:, None]))
+print(f"max |Spline1D - general path| over {len(check)} points:", diff.max())
+
+# %% [markdown]
+# ### 6.3 Saving `Spline1D` data, and loading old saved splines
+#
+# A `Spline1D` is fully determined by `(x, F)` — saving those two arrays and
+# reconstructing is exact and cheap. For interop with the general classes
+# (and with data saved by *older* versions of TPI), `to_coefficients()`
+# exports the standard `(n + 2,)` TPI coefficient vector, and the `coeffs=`
+# constructor argument accepts one:
+
+# %%
+c_1d = s_gsl.to_coefficients()
+
+# old-style saved data -> fast 1D path (works for any B-form coefficients
+# on these nodes, whether or not they came from an interpolation solve)
+s_from_old = TPI.Spline1D(x_large, coeffs=c_1d)
+# fast 1D path -> general ND class (e.g. to embed in an N-D workflow)
+fI_from_1d = TPI.TP_Interpolant_ND([x_large], coeffs=c_1d)
+
+print("round-trip agreement:",
+      np.abs(s_from_old(xq_sorted[:1000]) - s_gsl(xq_sorted[:1000])).max())
+
+# %% [markdown]
+# On the JAX side, construction itself can live inside `jit` (and on GPU)
+# through the functional core: `spline_1d_hermite(x, F)` returns the
+# per-interval coefficients, `spline_1d_evaluate(x, poly, xq)` evaluates
+# them. Both are pure JAX functions:
+
+# %%
+@jax.jit
+def build_and_eval(x, F, xq):
+    poly = TPI_jax.spline_1d_hermite(x, F)
+    return TPI_jax.spline_1d_evaluate(x, poly, xq)
+
+# warmup: trigger JIT compilation before timing/inspection
+_ = build_and_eval(x_large, F_large, xq_sorted[:10])
+print("jitted build+eval:", np.asarray(_)[:3])
 
 # %% [markdown]
 # ## Quick reference
@@ -698,4 +839,13 @@ print(f"  JAX vmap batch            {jax_vec_batch:9.3f} ms")
 # fV = TPI_jax.TP_Interpolant_ND_Vector.FromComponentSplines(nodes, [fI_1, ..., fI_M])
 # v  = fV(x)                                      # shape (M,), either backend
 # J  = jax.jacfwd(fV.TPInterpolationND)(x)        # Jacobian, shape (M, N)   [JAX]
+#
+# # --- dedicated 1D fast path (both backends; strictly increasing x, n >= 4) ---
+# s  = TPI.Spline1D(x, F=F)                       # tridiagonal solve, O(n)
+# s  = TPI_jax.Spline1D(x, F=F)                   # same, solve on JAX device
+# ys = s(xq)                                      # sorted xq -> O(M+n) C walk [GSL]
+# c  = s.to_coefficients()                        # standard (n+2,) TPI format
+# s2 = TPI.Spline1D(x, coeffs=c)                  # load old saved coefficients
+# poly = TPI_jax.spline_1d_hermite(x, F)          # pure-JAX build (jit/GPU-safe)
+# ys = TPI_jax.spline_1d_evaluate(x, poly, xq)    # pure-JAX eval (grad w.r.t. xq)
 # ```
