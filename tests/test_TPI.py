@@ -2477,6 +2477,156 @@ def test_gsl_ComputeSplineCoefficientsND_large_1d_grid():
     assert np.allclose(actual, expected, atol=1e-10, rtol=0)
 
 
+def _spline1d_case_grids():
+    rng = np.random.default_rng(42)
+    for n in (10, 137, 2000):
+        x = np.sort(rng.uniform(0.0, 10.0, n))
+        x[0] = 0.0
+        x[-1] = 10.0
+        x = np.unique(x)
+        F = np.sin(3.0 * x) * np.exp(-0.1 * x)
+        yield x, F
+
+
+def test_jax_Spline1D_matches_general_path_and_scipy():
+    from scipy.interpolate import CubicSpline
+
+    rng = np.random.default_rng(42)
+    for x, F in _spline1d_case_grids():
+        spline = TPI_jax.Spline1D(x, F=F)
+        general = TPI.TP_Interpolant_ND([x], F=F)
+        reference = CubicSpline(x, F, bc_type="not-a-knot")
+
+        xq = np.sort(rng.uniform(x[0], x[-1], 30))
+        actual = np.asarray(spline(xq))
+        expected_general = general.TPInterpolationND_batched(xq[:, None])
+        expected_scipy = reference(xq)
+
+        print(f"n={len(x)} vs general path:")
+        _print_coefficient_diffs(actual, expected_general)
+        print(f"n={len(x)} vs scipy CubicSpline:")
+        _print_coefficient_diffs(actual, expected_scipy)
+        assert np.allclose(actual, expected_general, atol=1e-10, rtol=0)
+        assert np.allclose(actual, expected_scipy, atol=1e-10, rtol=0)
+
+
+def test_jax_Spline1D_boundary_and_node_points():
+    x, F = next(_spline1d_case_grids())
+    spline = TPI_jax.Spline1D(x, F=F)
+    # endpoints, plus a sample of interior nodes: 10 points total
+    idx = np.linspace(0, len(x) - 1, 10).astype(int)
+    actual = np.asarray(spline(x[idx]))
+    _print_coefficient_diffs(actual, F[idx])
+    assert np.allclose(actual, F[idx], atol=1e-13, rtol=0)
+    # scalar input returns a scalar-shaped result
+    single = np.asarray(spline(float(x[3])))
+    assert single.shape == ()
+    assert np.allclose(single, F[3], atol=1e-13, rtol=0)
+
+
+def test_jax_Spline1D_stress_geometric_grid_reproduces_cubic():
+    x = np.unique(np.concatenate(([0.0], np.geomspace(1e-6, 1.0, 199))))
+    f = lambda t: 2.0 - 3.0 * t + 4.0 * t ** 2 - 5.0 * t ** 3
+    spline = TPI_jax.Spline1D(x, F=f(x))
+    xq = np.sort(np.random.default_rng(42).uniform(x[0], x[-1], 30))
+    actual = np.asarray(spline(xq))
+    expected = f(xq)
+    _print_coefficient_diffs(actual, expected)
+    assert np.allclose(actual, expected, atol=1e-12, rtol=0)
+
+
+def test_jax_Spline1D_jit_vmap_grad():
+    from scipy.interpolate import CubicSpline
+
+    x, F = next(_spline1d_case_grids())
+    spline = TPI_jax.Spline1D(x, F=F)
+    reference = CubicSpline(x, F, bc_type="not-a-knot")
+    xq = np.sort(np.random.default_rng(42).uniform(x[0], x[-1], 30))
+
+    # jit of the functional construction, with traced F and traced x
+    build = jax.jit(TPI_jax.spline_1d_hermite)
+    # warmup: trigger JIT compilation before assertions
+    jit_poly = build(jnp_x := jax.numpy.asarray(x), jax.numpy.asarray(F))
+    eager_poly = TPI_jax.spline_1d_hermite(jnp_x, jax.numpy.asarray(F))
+    for jit_c, eager_c in zip(jit_poly, eager_poly):
+        assert np.allclose(np.asarray(jit_c), np.asarray(eager_c), atol=1e-12, rtol=0)
+
+    # evaluation under jit + vmap over query points
+    eval_one = lambda q: spline(q)
+    batched = jax.jit(jax.vmap(eval_one))
+    # warmup: trigger JIT compilation before assertions
+    batched(xq)
+    actual = np.asarray(batched(xq))
+    assert np.allclose(actual, np.asarray(spline(xq)), atol=1e-14, rtol=0)
+
+    # gradient w.r.t. the query point: finite and matches scipy's derivative
+    grad_fn = jax.jit(jax.vmap(jax.grad(eval_one)))
+    # warmup: trigger JIT compilation before assertions
+    grad_fn(xq)
+    grads = np.asarray(grad_fn(xq))
+    expected_grads = reference.derivative()(xq)
+    assert np.isfinite(grads).all()
+    _print_coefficient_diffs(grads, expected_grads)
+    assert np.allclose(grads, expected_grads, atol=1e-8, rtol=0)
+
+
+def test_jax_Spline1D_coefficient_interop():
+    x, F = next(_spline1d_case_grids())
+    spline = TPI_jax.Spline1D(x, F=F)
+    general = TPI.TP_Interpolant_ND([x], F=F)
+
+    # to_coefficients: standard TPI format, matching the general path
+    coeffs = np.asarray(spline.to_coefficients())
+    expected = np.asarray(general.GetSplineCoefficientsND())
+    assert coeffs.shape == (len(x) + 2,)
+    _print_coefficient_diffs(coeffs, expected)
+    assert np.allclose(coeffs, expected, atol=1e-10, rtol=0)
+
+    # the exported coefficients round-trip through the general interpolant
+    xq = np.sort(np.random.default_rng(42).uniform(x[0], x[-1], 30))
+    roundtrip = TPI.TP_Interpolant_ND([x], coeffs=coeffs)
+    assert np.allclose(
+        roundtrip.TPInterpolationND_batched(xq[:, None]),
+        np.asarray(spline(xq)),
+        atol=1e-12,
+        rtol=0,
+    )
+
+    # from_coefficients: loading old saved data, including coefficients that
+    # did not come from a not-a-knot solve (arbitrary C^2 spline in B-form)
+    rng = np.random.default_rng(7)
+    arbitrary = rng.standard_normal(len(x) + 2)
+    loaded = TPI_jax.Spline1D(x, coeffs=arbitrary)
+    reference = TPI.TP_Interpolant_ND([x], coeffs=arbitrary)
+    actual = np.asarray(loaded(xq))
+    expected_eval = reference.TPInterpolationND_batched(xq[:, None])
+    _print_coefficient_diffs(actual, expected_eval)
+    assert np.allclose(actual, expected_eval, atol=1e-12, rtol=0)
+
+
+def test_jax_Spline1D_error_behavior():
+    x = np.linspace(0.0, 1.0, 10)
+    F = np.sin(x)
+
+    with pytest.raises(ValueError):
+        TPI_jax.Spline1D(np.array([0.0, 1.0, 2.0]), F=np.zeros(3))  # n < 4
+    with pytest.raises(ValueError):
+        TPI_jax.Spline1D(np.array([0.0, 1.0, 1.0, 2.0]), F=np.zeros(4))  # not strictly increasing
+    with pytest.raises(ValueError):
+        TPI_jax.Spline1D(x, F=np.zeros(11))  # wrong data length
+    with pytest.raises(ValueError):
+        TPI_jax.Spline1D(x, coeffs=np.zeros(13))  # wrong coefficient length
+
+    spline = TPI_jax.Spline1D(x, F=F)
+    with pytest.raises(ValueError):
+        spline(np.array([-0.5]))
+    with pytest.raises(ValueError):
+        spline(1.5)
+    # endpoints are accepted
+    values = np.asarray(spline(np.array([0.0, 1.0])))
+    assert np.allclose(values, [F[0], F[-1]], atol=1e-13, rtol=0)
+
+
 # Hack for running tests since pytest does not import the Cython module under python3
 # Just run: python3 test.py
 '''

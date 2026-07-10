@@ -220,6 +220,97 @@ def solve_banded_axis(ab, tensor, axis):
     return np.moveaxis(solved.reshape(moved.shape), 0, axis)
 
 
+def hermite_polynomial_pieces(x, f, s):
+    """Per-interval cubic coefficients from node values f and derivatives s.
+
+    Returns (c0, c1, c2, c3), each of length n - 1, such that the spline on
+    [x_i, x_{i+1}] is c0[i] + t*(c1[i] + t*(c2[i] + t*c3[i])) with t = x - x_i.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    f = np.asarray(f, dtype=np.float64)
+    s = np.asarray(s, dtype=np.float64)
+    dx = np.diff(x)
+    slope = np.diff(f) / dx
+    c0 = f[:-1]
+    c1 = s[:-1]
+    c2 = (3.0 * slope - 2.0 * s[:-1] - s[1:]) / dx
+    c3 = (s[:-1] + s[1:] - 2.0 * slope) / dx ** 2
+    return c0, c1, c2, c3
+
+
+def hermite_to_bspline_coefficients(x, c0, c1, c2, c3):
+    """Standard TPI B-form coefficients (shape (n + 2,)) of a piecewise cubic.
+
+    Uses the polar form (blossom) of the cubic pieces: coefficient j equals
+    the blossom evaluated at knots t_{j+1}, t_{j+2}, t_{j+3}, computed on a
+    polynomial piece whose interval touches those knots.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n = x.shape[0]
+    t = construct_knots(x)
+    j = np.arange(n + 2)
+    piece = np.clip(j, 3, n + 1) - 3
+    u = t[j + 1] - x[piece]
+    v = t[j + 2] - x[piece]
+    w = t[j + 3] - x[piece]
+    p0 = np.asarray(c0)[piece]
+    p1 = np.asarray(c1)[piece]
+    p2 = np.asarray(c2)[piece]
+    p3 = np.asarray(c3)[piece]
+    return (
+        p0
+        + p1 * (u + v + w) / 3.0
+        + p2 * (u * v + u * w + v * w) / 3.0
+        + p3 * (u * v * w)
+    )
+
+
+def bspline_to_hermite(x, coeffs):
+    """Exact node values and first derivatives of a B-form cubic spline.
+
+    Works for arbitrary coefficient vectors on the TPI knot vector (any C^2
+    cubic spline in B-form), not only not-a-knot interpolants: values come
+    from the 4 active cubic basis functions per node, derivatives from the
+    quadratic B-form of the derivative spline. Requires strictly increasing
+    nodes.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    coeffs = np.asarray(coeffs, dtype=np.float64)
+    n = x.shape[0]
+    N = n + 2
+    t = construct_knots(x)
+
+    basis4, starts = active_basis_at_nodes(x)
+    idx = starts[:, None] + np.arange(4)
+    f = np.sum(basis4 * coeffs[idx], axis=1)
+
+    # Derivative spline: quadratic B-form with coefficients e_j (j = 1..N-1)
+    e = np.zeros(N)
+    jj = np.arange(1, N)
+    e[1:] = 3.0 * (coeffs[1:] - coeffs[:-1]) / (t[jj + 3] - t[jj])
+
+    # The 3 active quadratic basis values at each node (de Boor, degree 2)
+    spans = np.minimum(np.arange(n) + 3, n + 1)
+    k = t[spans[:, None] + np.arange(-1, 3)]
+    l1 = x - k[:, 1]
+    l2 = x - k[:, 0]
+    r1 = k[:, 2] - x
+    r2 = k[:, 3] - x
+    b0 = r1 / (r1 + l1)
+    b1 = l1 / (r1 + l1)
+    q0 = r1 * b0 / (r1 + l2)
+    q1 = l2 * b0 / (r1 + l2) + r2 * b1 / (r2 + l1)
+    q2 = l1 * b1 / (r2 + l1)
+
+    qidx = spans[:, None] + np.arange(-2, 1)
+    s = (
+        q0 * e[qidx[:, 0]]
+        + q1 * e[qidx[:, 1]]
+        + q2 * e[qidx[:, 2]]
+    )
+    return f, s
+
+
 def _banded_to_dense(ab, N):
     """Expand LAPACK banded storage back to the dense (N, N) matrix."""
     A = np.zeros((N, N))

@@ -592,6 +592,152 @@ class TP_Interpolant_ND:
         return self.TPInterpolationND(X_arr)
 
 
+def _validate_spline1d_nodes(x):
+    x_np = np.asarray(x, dtype=np.float64)
+    if x_np.ndim != 1:
+        raise ValueError("Input nodes must be one-dimensional.")
+    if x_np.shape[0] < 4:
+        raise ValueError("Require at least four input nodes for Spline1D.")
+    if not np.isfinite(x_np).all():
+        raise ValueError("Input nodes must be finite.")
+    if (np.diff(x_np) <= 0.0).any():
+        raise ValueError("Input nodes must be strictly increasing for Spline1D.")
+    return x_np
+
+
+def spline_1d_hermite(x, F):
+    """Per-interval cubic coefficients of the 1D not-a-knot spline, pure JAX.
+
+    Solves the classic tridiagonal not-a-knot system for the node derivatives
+    with jax.lax.linalg.tridiagonal_solve, so construction is jit-compatible
+    and runs entirely on the JAX device (GPU-capable, no host callback).
+    Sortedness of x is exploited throughout: no search is performed anywhere,
+    interval i is known by position.
+
+    Returns (c0, c1, c2, c3), each of length n - 1: the spline on
+    [x[i], x[i+1]] is c0[i] + t*(c1[i] + t*(c2[i] + t*c3[i])), t = xq - x[i].
+    """
+    x = jnp.asarray(x, dtype=jnp.float64)
+    F = jnp.asarray(F, dtype=jnp.float64)
+    dx = jnp.diff(x)
+    slope = jnp.diff(F) / dx
+
+    # Not-a-knot boundary rows reduced to tridiagonal form (scipy CubicSpline
+    # formulation); interior rows are the standard C^2 continuity conditions.
+    d_left = x[2] - x[0]
+    d_right = x[-1] - x[-3]
+    dl = jnp.concatenate((jnp.zeros(1, x.dtype), dx[1:], d_right[None]))
+    diag = jnp.concatenate((dx[1:2], 2.0 * (dx[:-1] + dx[1:]), dx[-2:-1]))
+    du = jnp.concatenate((d_left[None], dx[:-1], jnp.zeros(1, x.dtype)))
+    b_left = (
+        (dx[0] + 2.0 * d_left) * dx[1] * slope[0] + dx[0] ** 2 * slope[1]
+    ) / d_left
+    b_right = (
+        dx[-1] ** 2 * slope[-2] + (2.0 * d_right + dx[-1]) * dx[-2] * slope[-1]
+    ) / d_right
+    b = jnp.concatenate(
+        (b_left[None], 3.0 * (dx[1:] * slope[:-1] + dx[:-1] * slope[1:]), b_right[None])
+    )
+
+    s = jax.lax.linalg.tridiagonal_solve(dl, diag, du, b[:, None])[:, 0]
+
+    c0 = F[:-1]
+    c1 = s[:-1]
+    c2 = (3.0 * slope - 2.0 * s[:-1] - s[1:]) / dx
+    c3 = (s[:-1] + s[1:] - 2.0 * slope) / dx ** 2
+    return c0, c1, c2, c3
+
+
+def spline_1d_evaluate(x, poly, xq):
+    """Evaluate per-interval cubic pieces at query points, pure JAX.
+
+    Differentiable w.r.t. xq and vmap/jit-compatible. Accepts scalar or
+    1D xq; the span search is a vectorized searchsorted on the node array.
+    """
+    x = jnp.asarray(x, dtype=jnp.float64)
+    xq = jnp.asarray(xq, dtype=jnp.float64)
+    c0, c1, c2, c3 = poly
+    i = jnp.clip(jnp.searchsorted(x, xq, side="right") - 1, 0, x.shape[0] - 2)
+    t = xq - x[i]
+    return c0[i] + t * (c1[i] + t * (c2[i] + t * c3[i]))
+
+
+_spline_1d_hermite_jit = jax.jit(spline_1d_hermite)
+
+
+class Spline1D:
+    """Dedicated fast 1D cubic spline (not-a-knot) in native Hermite form.
+
+    Construction solves the classic tridiagonal system for the node
+    derivatives entirely on the JAX device (GPU-capable, no host callback)
+    and stores per-interval polynomial coefficients; evaluation is a
+    vectorized span search plus Horner evaluation, jit/vmap-compatible and
+    differentiable w.r.t. the query points. Nodes must be strictly
+    increasing with at least 4 points.
+
+    Interop with the general TP_Interpolant_ND classes and previously saved
+    data: to_coefficients() exports the standard TPI coefficient vector of
+    shape (n + 2,), and the coeffs= constructor argument loads one (any
+    B-form cubic spline on these nodes, not only not-a-knot interpolants).
+    """
+
+    def __init__(self, x, F=None, coeffs=None):
+        x_np = _validate_spline1d_nodes(x)
+        self.x = jnp.asarray(x_np)
+        self.n = int(x_np.shape[0])
+        # Host-side bounds: reading device arrays per call would force a sync.
+        self._x_min = float(x_np[0])
+        self._x_max = float(x_np[-1])
+        self.poly = None
+        self._jit_eval = jax.jit(
+            lambda poly, xq: spline_1d_evaluate(self.x, poly, xq)
+        )
+        if F is not None and coeffs is not None:
+            raise ValueError("Pass either F or coeffs, not both.")
+        if F is not None:
+            F_np = np.asarray(F, dtype=np.float64)
+            if F_np.shape != (self.n,):
+                raise ValueError(f"Data should have shape [{self.n}]")
+            self.poly = _spline_1d_hermite_jit(self.x, jnp.asarray(F_np))
+        elif coeffs is not None:
+            coeffs_np = np.asarray(coeffs, dtype=np.float64)
+            if coeffs_np.shape != (self.n + 2,):
+                raise ValueError(
+                    f"Spline coefficients should have shape [{self.n + 2}]"
+                )
+            f, s = TPI_banded.bspline_to_hermite(x_np, coeffs_np)
+            pieces = TPI_banded.hermite_polynomial_pieces(x_np, f, s)
+            self.poly = tuple(jnp.asarray(c) for c in pieces)
+
+    def to_coefficients(self):
+        """Standard TPI coefficient vector (shape (n + 2,)) of this spline."""
+        if self.poly is None:
+            raise ValueError("Spline coefficients have not been set.")
+        c0, c1, c2, c3 = (np.asarray(c) for c in self.poly)
+        return TPI_banded.hermite_to_bspline_coefficients(
+            np.asarray(self.x), c0, c1, c2, c3
+        )
+
+    def __call__(self, xq):
+        if self.poly is None:
+            raise ValueError("Spline coefficients have not been set.")
+
+        if isinstance(xq, jax_core.Tracer):
+            return spline_1d_evaluate(self.x, self.poly, xq)
+
+        xq_np = np.asarray(xq, dtype=np.float64)
+        if xq_np.ndim > 1:
+            raise ValueError("Query points must be scalar or one-dimensional!")
+        if np.any(xq_np < self._x_min) or np.any(xq_np > self._x_max):
+            bad = np.atleast_1d(xq_np)
+            bad_value = bad[(bad < self._x_min) | (bad > self._x_max)][0]
+            raise ValueError(
+                f"Spline1D: x = {bad_value} is outside of knots vector "
+                f"[{self._x_min}, {self._x_max}]!"
+            )
+        return self._jit_eval(self.poly, xq_np)
+
+
 class TP_Interpolant_ND_Vector(TP_Interpolant_ND):
     """Tensor-product spline interpolant for vector/tensor-valued data.
 
