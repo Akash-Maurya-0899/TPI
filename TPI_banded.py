@@ -234,17 +234,16 @@ def validate_spline1d_nodes(x):
     return x_np
 
 
-def spline1d_derivatives_notaknot(x, f):
-    """Node derivatives of the 1D not-a-knot cubic interpolant.
+def spline1d_tridiagonal_system(x):
+    """Data-independent pieces of the 1D not-a-knot derivative solve.
 
-    Solves the classic tridiagonal system (scipy CubicSpline formulation,
-    not-a-knot rows reduced to tridiagonal form) with scipy's banded solver.
-    The construction performs no search: interval i is known by position.
+    Returns (ab, dx, d_left, d_right): the tridiagonal matrix in LAPACK
+    banded storage plus the node spacings and boundary widths. Everything
+    here depends only on the nodes, so it can be cached and reused when
+    refitting many datasets on one grid.
     """
     x = np.asarray(x, dtype=np.float64)
-    f = np.asarray(f, dtype=np.float64)
     dx = np.diff(x)
-    slope = np.diff(f) / dx
     n = x.shape[0]
 
     d_left = x[2] - x[0]
@@ -252,6 +251,30 @@ def spline1d_derivatives_notaknot(x, f):
     dl = np.concatenate(([0.0], dx[1:], [d_right]))
     diag = np.concatenate((dx[1:2], 2.0 * (dx[:-1] + dx[1:]), dx[-2:-1]))
     du = np.concatenate(([d_left], dx[:-1], [0.0]))
+
+    ab = np.zeros((3, n))
+    ab[0, 1:] = du[:-1]
+    ab[1, :] = diag
+    ab[2, :-1] = dl[1:]
+    return ab, dx, d_left, d_right
+
+
+def spline1d_derivatives_notaknot(x, f, system=None):
+    """Node derivatives of the 1D not-a-knot cubic interpolant.
+
+    Solves the classic tridiagonal system (scipy CubicSpline formulation,
+    not-a-knot rows reduced to tridiagonal form) with scipy's banded solver.
+    The construction performs no search: interval i is known by position.
+    Pass a cached spline1d_tridiagonal_system(x) as system to skip the
+    data-independent assembly when refitting on a fixed grid.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    f = np.asarray(f, dtype=np.float64)
+    if system is None:
+        system = spline1d_tridiagonal_system(x)
+    ab, dx, d_left, d_right = system
+    slope = np.diff(f) / dx
+
     b_left = ((dx[0] + 2.0 * d_left) * dx[1] * slope[0] + dx[0] ** 2 * slope[1]) / d_left
     b_right = (
         dx[-1] ** 2 * slope[-2] + (2.0 * d_right + dx[-1]) * dx[-2] * slope[-1]
@@ -259,11 +282,6 @@ def spline1d_derivatives_notaknot(x, f):
     b = np.concatenate(
         ([b_left], 3.0 * (dx[1:] * slope[:-1] + dx[:-1] * slope[1:]), [b_right])
     )
-
-    ab = np.zeros((3, n))
-    ab[0, 1:] = du[:-1]
-    ab[1, :] = diag
-    ab[2, :-1] = dl[1:]
     return solve_banded((1, 1), ab, b, check_finite=False)
 
 

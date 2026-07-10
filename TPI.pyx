@@ -779,6 +779,7 @@ cdef class Spline1D:
     """
 
     cdef x_arr, c0, c1, c2, c3
+    cdef _system
     cdef int n
     cdef double _x_min, _x_max
 
@@ -799,14 +800,11 @@ cdef class Spline1D:
         self._x_min = x_np[0]
         self._x_max = x_np[-1]
         self.c0 = None
+        self._system = None
         if F is not None and coeffs is not None:
             raise ValueError("Pass either F or coeffs, not both.")
         if F is not None:
-            F_np = np.asarray(F, dtype=np.double)
-            if F_np.shape != (self.n,):
-                raise ValueError("Data should have shape [%d]" % self.n)
-            s = TPI_banded.spline1d_derivatives_notaknot(x_np, F_np)
-            self._set_pieces(TPI_banded.hermite_polynomial_pieces(x_np, F_np, s))
+            self.ComputeSplineCoefficients(F)
         elif coeffs is not None:
             coeffs_np = np.asarray(coeffs, dtype=np.double)
             if coeffs_np.shape != (self.n + 2,):
@@ -818,6 +816,26 @@ cdef class Spline1D:
     def _set_pieces(self, pieces):
         self.c0, self.c1, self.c2, self.c3 = [
             np.ascontiguousarray(c, dtype=np.double) for c in pieces]
+
+    def ComputeSplineCoefficients(self, F):
+        """Compute the spline for data F on the stored node grid.
+
+        The data-independent tridiagonal system is cached on this instance,
+        so refitting many datasets on one grid skips node validation and
+        matrix assembly and only pays the O(n) solve.
+
+        Arguments:
+          * F: data values at the nodes, shape (len(x),).
+
+        """
+        F_np = np.asarray(F, dtype=np.double)
+        if F_np.shape != (self.n,):
+            raise ValueError("Data should have shape [%d]" % self.n)
+        if self._system is None:
+            self._system = TPI_banded.spline1d_tridiagonal_system(self.x_arr)
+        s = TPI_banded.spline1d_derivatives_notaknot(self.x_arr, F_np,
+                                                     system=self._system)
+        self._set_pieces(TPI_banded.hermite_polynomial_pieces(self.x_arr, F_np, s))
 
     def to_coefficients(self):
         """Standard TPI coefficient vector (shape (n + 2,)) of this spline."""

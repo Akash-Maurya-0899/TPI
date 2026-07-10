@@ -682,10 +682,7 @@ class Spline1D:
         if F is not None and coeffs is not None:
             raise ValueError("Pass either F or coeffs, not both.")
         if F is not None:
-            F_np = np.asarray(F, dtype=np.float64)
-            if F_np.shape != (self.n,):
-                raise ValueError(f"Data should have shape [{self.n}]")
-            self.poly = _spline_1d_hermite_jit(self.x, jnp.asarray(F_np))
+            self.ComputeSplineCoefficients(F)
         elif coeffs is not None:
             coeffs_np = np.asarray(coeffs, dtype=np.float64)
             if coeffs_np.shape != (self.n + 2,):
@@ -695,6 +692,22 @@ class Spline1D:
             f, s = TPI_banded.bspline_to_hermite(x_np, coeffs_np)
             pieces = TPI_banded.hermite_polynomial_pieces(x_np, f, s)
             self.poly = tuple(jnp.asarray(c) for c in pieces)
+
+    def ComputeSplineCoefficients(self, F):
+        """Compute the spline for data F on the stored node grid.
+
+        Refitting through this method reuses the instance's compiled
+        kernels: the construction solve hits the jit compilation cache and,
+        unlike constructing a new Spline1D, the per-instance compiled
+        evaluator is preserved, so the next evaluation does not retrace.
+
+        Arguments:
+          * F: data values at the nodes, shape (len(x),).
+        """
+        F_np = np.asarray(F, dtype=np.float64)
+        if F_np.shape != (self.n,):
+            raise ValueError(f"Data should have shape [{self.n}]")
+        self.poly = _spline_1d_hermite_jit(self.x, jnp.asarray(F_np))
 
     def to_coefficients(self):
         """Standard TPI coefficient vector (shape (n + 2,)) of this spline."""

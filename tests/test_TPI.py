@@ -2735,6 +2735,41 @@ def test_gsl_Spline1D_error_behavior():
     assert np.allclose(single, F[3], atol=1e-13, rtol=0)
 
 
+def test_Spline1D_recompute_coefficients_on_fixed_grid():
+    """ComputeSplineCoefficients(F) refits new data reusing the instance.
+
+    The refit must match a freshly constructed Spline1D exactly, in both
+    backends, including after the instance was loaded from coefficients.
+    """
+    rng = np.random.default_rng(42)
+    x = np.sort(rng.uniform(0.0, 10.0, 137))
+    x[0], x[-1] = 0.0, 10.0
+    F1 = np.sin(3.0 * x) * np.exp(-0.1 * x)
+    F2 = np.cos(2.0 * x) + 0.1 * x
+    xq = np.sort(rng.uniform(0.0, 10.0, 30))
+
+    for module in (TPI, TPI_jax):
+        spline = module.Spline1D(x, F=F1)
+        before = np.asarray(spline(xq))
+
+        result = spline.ComputeSplineCoefficients(F2)
+        assert result is None
+        actual = np.asarray(spline(xq))
+        expected = np.asarray(module.Spline1D(x, F=F2)(xq))
+        print(f"{module.__name__} refit vs fresh instance:")
+        _print_coefficient_diffs(actual, expected)
+        assert np.array_equal(actual, expected)
+        assert not np.allclose(actual, before, atol=1e-6, rtol=0)
+
+        # refit works on an instance that was loaded from coefficients
+        loaded = module.Spline1D(x, coeffs=module.Spline1D(x, F=F1).to_coefficients())
+        loaded.ComputeSplineCoefficients(F2)
+        assert np.array_equal(np.asarray(loaded(xq)), expected)
+
+        with pytest.raises(ValueError):
+            spline.ComputeSplineCoefficients(np.zeros(len(x) + 1))
+
+
 # Hack for running tests since pytest does not import the Cython module under python3
 # Just run: python3 test.py
 '''
