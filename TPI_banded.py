@@ -38,6 +38,15 @@ from scipy.linalg import solve_banded
 KL = 4
 KU = 4
 
+# Axes with N = n + 2 at or below this use a cached dense inverse applied as
+# a single matrix product per solve, exactly like the historical dense
+# implementation: LAPACK's banded solve processes right-hand sides column by
+# column plus pivot row swaps, which is memory-bound for the many-RHS solves
+# of small ND grid axes, while the inverse-times-RHS is one BLAS-3 gemm.
+# Larger axes use the O(n)-memory banded solve, where a dense inverse would
+# need O(n^2) memory.
+DENSE_SOLVE_MAX_N = 512
+
 
 def construct_knots(nodes):
     """Clamped cubic knot vector: endpoints with multiplicity 3 around the nodes."""
@@ -208,4 +217,44 @@ def solve_banded_axis(ab, tensor, axis):
     solved = solve_banded(
         (KL, KU), ab, moved.reshape(moved.shape[0], -1), check_finite=False
     )
+    return np.moveaxis(solved.reshape(moved.shape), 0, axis)
+
+
+def _banded_to_dense(ab, N):
+    """Expand LAPACK banded storage back to the dense (N, N) matrix."""
+    A = np.zeros((N, N))
+    for offset in range(-KL, KU + 1):
+        j = np.arange(max(0, -offset), min(N, N - offset))
+        A[j + offset, j] = ab[KU + offset, j]
+    return A
+
+
+def factor_collocation_matrix(nodes, row_first=None, row_last=None):
+    """Factor the collocation matrix for repeated solves on one node array.
+
+    Returns ("dense_inv", A_inv) for small axes (one gemm per solve, matching
+    the historical dense implementation) or ("banded", ab) for large axes
+    (O(n) memory). If the boundary rows are omitted they are computed with
+    notaknot_boundary_rows.
+    """
+    nodes = np.asarray(nodes, dtype=np.float64)
+    if row_first is None or row_last is None:
+        row_first, row_last = notaknot_boundary_rows(nodes)
+    ab = assemble_banded_ab(nodes, row_first, row_last)
+    N = nodes.shape[0] + 2
+    if N <= DENSE_SOLVE_MAX_N:
+        return ("dense_inv", np.linalg.inv(_banded_to_dense(ab, N)))
+    return ("banded", ab)
+
+
+def solve_collocation_axis(factor, tensor, axis):
+    """Solve a factored collocation system along one tensor axis."""
+    kind, data = factor
+    tensor = np.asarray(tensor, dtype=np.float64)
+    moved = np.moveaxis(tensor, axis, 0)
+    rhs = moved.reshape(moved.shape[0], -1)
+    if kind == "dense_inv":
+        solved = data @ rhs
+    else:
+        solved = solve_banded((KL, KU), data, rhs, check_finite=False)
     return np.moveaxis(solved.reshape(moved.shape), 0, axis)

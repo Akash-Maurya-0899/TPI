@@ -286,9 +286,9 @@ def _assemble_spline_matrix_jax(nodes):
 
 
 def _banded_spline_factors(nodes):
-    """Banded collocation matrices for concrete node arrays, host-side."""
+    """Factored collocation matrices for concrete node arrays, host-side."""
     return tuple(
-        TPI_banded.assemble_spline_matrix_banded(np.asarray(node, dtype=np.float64))
+        TPI_banded.factor_collocation_matrix(np.asarray(node, dtype=np.float64))
         for node in nodes
     )
 
@@ -297,7 +297,7 @@ def _banded_solve_host(factors, F_np, ngrid, values_ndim):
     """Pad the grid axes and run the banded solve along each grid axis."""
     coeffs = np.pad(F_np, [(1, 1)] * ngrid + [(0, 0)] * values_ndim, mode="constant")
     for axis in range(ngrid - 1, -1, -1):
-        coeffs = TPI_banded.solve_banded_axis(factors[axis], coeffs, axis)
+        coeffs = TPI_banded.solve_collocation_axis(factors[axis], coeffs, axis)
     return coeffs
 
 

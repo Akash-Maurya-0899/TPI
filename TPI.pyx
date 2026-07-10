@@ -166,6 +166,7 @@ cdef class TP_Interpolant_ND:
     cdef gsl_bspline_workspace **bw_array_ptrs
     cdef nodes, n
     cdef c, c_flat, knots_list
+    cdef _banded_matrices
 
     def __init__(self, list nodes, coeffs=None, F=None):
         """Constructor
@@ -322,6 +323,31 @@ cdef class TP_Interpolant_ND:
 
         return self.TPInterpolationND(X_array)
 
+    def _assemble_banded_matrices(self):
+        """Assemble and cache the banded 1D spline matrices and knot vectors.
+
+        The not-a-knot boundary rows come from EvaluateBsplines3rdDerivatives
+        so the numerics match the dense AssembleSplineMatrix rows.
+        """
+        if self._banded_matrices is not None:
+            return self._banded_matrices
+        nodesND = self.nodes
+        banded_matrices = []
+        knots_list = []
+        cdef unsigned int i
+        for i in range(self.n):
+            xi = nodesND[i]
+            b = BsplineBasis1D(xi)
+            r1 = b.EvaluateBsplines3rdDerivatives((xi[0] + xi[1]) / 2.) \
+               - b.EvaluateBsplines3rdDerivatives((xi[1] + xi[2]) / 2.)
+            rm1 = b.EvaluateBsplines3rdDerivatives((xi[-3] + xi[-2]) / 2.) \
+                - b.EvaluateBsplines3rdDerivatives((xi[-2] + xi[-1]) / 2.)
+            banded_matrices.append(TPI_banded.factor_collocation_matrix(xi, r1, rm1))
+            knots_list.append(TPI_banded.construct_knots(xi))
+        self.knots_list = knots_list
+        self._banded_matrices = banded_matrices
+        return banded_matrices
+
     def ComputeSplineCoefficientsND(self, F):
         """Compute tensor product spline coefficients on the stored grid using data F.
 
@@ -339,20 +365,9 @@ cdef class TP_Interpolant_ND:
 
         # Assemble the 1D spline matrices in banded storage; the dense
         # (n+2)^2 assembly with an explicit inverse needs O(n^2) memory and
-        # O(n^3) time per axis, the banded form O(n) for both.
-        banded_matrices = []
-        knots_list = []
-        cdef unsigned int i
-        for i in range(d):
-            xi = nodesND[i]
-            b = BsplineBasis1D(xi)
-            r1 = b.EvaluateBsplines3rdDerivatives((xi[0] + xi[1]) / 2.) \
-               - b.EvaluateBsplines3rdDerivatives((xi[1] + xi[2]) / 2.)
-            rm1 = b.EvaluateBsplines3rdDerivatives((xi[-3] + xi[-2]) / 2.) \
-                - b.EvaluateBsplines3rdDerivatives((xi[-2] + xi[-1]) / 2.)
-            banded_matrices.append(TPI_banded.assemble_banded_ab(xi, r1, rm1))
-            knots_list.append(TPI_banded.construct_knots(xi))
-        self.knots_list = knots_list
+        # O(n^3) time per axis, the banded form O(n) for both. The nodes are
+        # fixed per instance, so the matrices are assembled once and cached.
+        banded_matrices = self._assemble_banded_matrices()
 
         # pad boundaries with zeroes since we have 2 more equations with the not-a-knot conditions than data
         F0 = np.pad(F, 1, 'constant')
@@ -361,7 +376,7 @@ cdef class TP_Interpolant_ND:
         # the coefficient tensor; solve_banded_axis preserves the axis order.
         tmp_result = F0
         for axis in range(d - 1, -1, -1):
-            tmp_result = TPI_banded.solve_banded_axis(banded_matrices[axis], tmp_result, axis)
+            tmp_result = TPI_banded.solve_collocation_axis(banded_matrices[axis], tmp_result, axis)
         self.c = tmp_result
         # ravel() is a no-copy view here since tmp_result is a fresh contiguous array
         self.c_flat = np.ascontiguousarray(tmp_result, dtype=np.double).ravel()
@@ -509,21 +524,9 @@ cdef class TP_Interpolant_ND_Vector(TP_Interpolant_ND):
                 "Data on TP grid should have shape {}".format(list(dims) + list(values_shape))
             )
 
-        # Assemble the 1D spline matrices in banded storage; see the scalar
-        # class for the memory rationale.
-        banded_matrices = []
-        knots_list = []
-        cdef unsigned int i
-        for i in range(d):
-            xi = nodesND[i]
-            b = BsplineBasis1D(xi)
-            r1 = b.EvaluateBsplines3rdDerivatives((xi[0] + xi[1]) / 2.) \
-               - b.EvaluateBsplines3rdDerivatives((xi[1] + xi[2]) / 2.)
-            rm1 = b.EvaluateBsplines3rdDerivatives((xi[-3] + xi[-2]) / 2.) \
-                - b.EvaluateBsplines3rdDerivatives((xi[-2] + xi[-1]) / 2.)
-            banded_matrices.append(TPI_banded.assemble_banded_ab(xi, r1, rm1))
-            knots_list.append(TPI_banded.construct_knots(xi))
-        self.knots_list = knots_list
+        # Assemble the banded 1D spline matrices (cached per instance); see
+        # the scalar class for the memory rationale.
+        banded_matrices = self._assemble_banded_matrices()
 
         # pad only the grid axes with zeroes (2 more equations per grid axis with
         # the not-a-knot conditions); value axes ride along as extra right-hand sides
@@ -534,7 +537,7 @@ cdef class TP_Interpolant_ND_Vector(TP_Interpolant_ND):
         # along as extra right-hand sides.
         tmp_result = F0
         for axis in range(d - 1, -1, -1):
-            tmp_result = TPI_banded.solve_banded_axis(banded_matrices[axis], tmp_result, axis)
+            tmp_result = TPI_banded.solve_collocation_axis(banded_matrices[axis], tmp_result, axis)
         self.c = tmp_result
         # ravel() is a no-copy view here since tmp_result is a fresh contiguous array
         self.c_flat = np.ascontiguousarray(tmp_result, dtype=np.double).ravel()
