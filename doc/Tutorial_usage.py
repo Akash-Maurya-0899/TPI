@@ -467,7 +467,9 @@ print(f"  JAX (steady)              {jax_construct:8.3f} ms")
 # %% [markdown]
 # If you rebuild coefficients repeatedly on a *fixed grid* (e.g. fitting many
 # datasets), reuse the interpolant and call `ComputeSplineCoefficientsND(F)`
-# — the factored spline matrices are cached, so only the solves rerun:
+# — the factored spline matrices are cached, so only the solves rerun.
+# (The dedicated 1D path has the same capability:
+# `Spline1D.ComputeSplineCoefficients(F)`, see section 6.)
 
 # %%
 gsl_solve = median_ms(fI_gsl.ComputeSplineCoefficientsND, F, repeat=20)
@@ -768,6 +770,29 @@ print(f"  Spline1D GSL {ev_gsl_1d:8.1f} ms | Spline1D JAX {ev_jax_1d:8.1f} ms "
       f"| general GSL batched ~{ev_gsl_gen_scaled:8.0f} ms (scaled from 20k points)")
 
 # %% [markdown]
+# Just like `ComputeSplineCoefficientsND` on the general classes
+# (section 5.1), `Spline1D` can refit new data on the *fixed* grid without
+# reconstructing the object — `ComputeSplineCoefficients(F)`. The
+# data-independent tridiagonal system is cached on the instance, so a refit
+# skips validation and matrix assembly. On the JAX side this matters even
+# more: each `Spline1D` instance carries its own compiled evaluator, and
+# refitting preserves it, while constructing a new instance forces a
+# recompile on the next evaluation (tens of milliseconds).
+
+# %%
+F2 = np.cos(0.2 * x_large) + 0.01 * x_large
+
+refit_gsl = median_ms(s_gsl.ComputeSplineCoefficients, F2, repeat=10)
+refit_jax = median_ms(lambda: (s_jax.ComputeSplineCoefficients(F2), s_jax.poly)[1], repeat=10)
+print(f"refit on fixed grid, n={n_large}:")
+print(f"  Spline1D GSL {refit_gsl:8.1f} ms (construction was {con_gsl_1d:.1f} ms)")
+print(f"  Spline1D JAX {refit_jax:8.1f} ms (construction was {con_jax_1d:.1f} ms, "
+      f"and the compiled evaluator survives)")
+print("refit result:", np.asarray(s_gsl(xq_sorted[:3])))
+s_gsl.ComputeSplineCoefficients(F_large)  # restore for the cells below
+s_jax.ComputeSplineCoefficients(F_large)
+
+# %% [markdown]
 # Accuracy is identical to the general path (same spline, different — and on
 # pathological grids equally stable — factorization):
 
@@ -843,6 +868,7 @@ print("jitted build+eval:", np.asarray(_)[:3])
 # # --- dedicated 1D fast path (both backends; strictly increasing x, n >= 4) ---
 # s  = TPI.Spline1D(x, F=F)                       # tridiagonal solve, O(n)
 # s  = TPI_jax.Spline1D(x, F=F)                   # same, solve on JAX device
+# s.ComputeSplineCoefficients(F_new)              # refit new data, same grid
 # ys = s(xq)                                      # sorted xq -> O(M+n) C walk [GSL]
 # c  = s.to_coefficients()                        # standard (n+2,) TPI format
 # s2 = TPI.Spline1D(x, coeffs=c)                  # load old saved coefficients
