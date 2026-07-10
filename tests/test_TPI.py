@@ -2627,6 +2627,114 @@ def test_jax_Spline1D_error_behavior():
     assert np.allclose(values, [F[0], F[-1]], atol=1e-13, rtol=0)
 
 
+def test_gsl_Spline1D_matches_general_path_and_scipy():
+    from scipy.interpolate import CubicSpline
+
+    rng = np.random.default_rng(42)
+    for x, F in _spline1d_case_grids():
+        spline = TPI.Spline1D(x, F=F)
+        general = TPI.TP_Interpolant_ND([x], F=F)
+        reference = CubicSpline(x, F, bc_type="not-a-knot")
+
+        xq = np.sort(rng.uniform(x[0], x[-1], 30))
+        actual = np.asarray(spline(xq))
+        expected_general = general.TPInterpolationND_batched(xq[:, None])
+        expected_scipy = reference(xq)
+
+        print(f"n={len(x)} vs general path:")
+        _print_coefficient_diffs(actual, expected_general)
+        print(f"n={len(x)} vs scipy CubicSpline:")
+        _print_coefficient_diffs(actual, expected_scipy)
+        assert np.allclose(actual, expected_general, atol=1e-10, rtol=0)
+        assert np.allclose(actual, expected_scipy, atol=1e-10, rtol=0)
+
+
+def test_Spline1D_cross_backend_parity():
+    for x, F in _spline1d_case_grids():
+        cpu = TPI.Spline1D(x, F=F)
+        jax_spline = TPI_jax.Spline1D(x, F=F)
+        xq = np.sort(np.random.default_rng(42).uniform(x[0], x[-1], 30))
+        actual = np.asarray(cpu(xq))
+        expected = np.asarray(jax_spline(xq))
+        print(f"n={len(x)} CPU vs JAX Spline1D:")
+        _print_coefficient_diffs(actual, expected)
+        assert np.allclose(actual, expected, atol=1e-12, rtol=0)
+
+
+def test_gsl_Spline1D_sorted_walk_edge_cases():
+    x, F = next(_spline1d_case_grids())
+    spline = TPI.Spline1D(x, F=F)
+    rng = np.random.default_rng(42)
+
+    # duplicate query points, endpoints included, node hits
+    xq = np.sort(np.concatenate((
+        [x[0], x[0], x[-1], x[-1]], x[3:6], [x[4], x[4]],
+        rng.uniform(x[0], x[-1], 21),
+    )))
+    sorted_result = np.asarray(spline(xq))
+
+    # all queries inside one interval
+    inner = np.linspace(x[2], np.nextafter(x[3], x[2]), 10)
+    one_interval = np.asarray(spline(inner))
+    from scipy.interpolate import CubicSpline
+    reference = CubicSpline(x, F, bc_type="not-a-knot")
+    assert np.allclose(one_interval, reference(inner), atol=1e-12, rtol=0)
+
+    # unsorted queries take the fallback path and must agree with the walk
+    perm = rng.permutation(len(xq))
+    unsorted_result = np.asarray(spline(xq[perm]))
+    _print_coefficient_diffs(unsorted_result, sorted_result[perm])
+    assert np.array_equal(unsorted_result, sorted_result[perm])
+    assert np.allclose(sorted_result, reference(xq), atol=1e-12, rtol=0)
+
+
+def test_gsl_Spline1D_coefficient_interop():
+    x, F = next(_spline1d_case_grids())
+    spline = TPI.Spline1D(x, F=F)
+    general = TPI.TP_Interpolant_ND([x], F=F)
+
+    coeffs = np.asarray(spline.to_coefficients())
+    expected = np.asarray(general.GetSplineCoefficientsND())
+    assert coeffs.shape == (len(x) + 2,)
+    _print_coefficient_diffs(coeffs, expected)
+    assert np.allclose(coeffs, expected, atol=1e-10, rtol=0)
+
+    xq = np.sort(np.random.default_rng(42).uniform(x[0], x[-1], 30))
+    rng = np.random.default_rng(7)
+    arbitrary = rng.standard_normal(len(x) + 2)
+    loaded = TPI.Spline1D(x, coeffs=arbitrary)
+    reference = TPI.TP_Interpolant_ND([x], coeffs=arbitrary)
+    actual = np.asarray(loaded(xq))
+    expected_eval = reference.TPInterpolationND_batched(xq[:, None])
+    _print_coefficient_diffs(actual, expected_eval)
+    assert np.allclose(actual, expected_eval, atol=1e-12, rtol=0)
+
+
+def test_gsl_Spline1D_error_behavior():
+    x = np.linspace(0.0, 1.0, 10)
+    F = np.sin(x)
+
+    with pytest.raises(ValueError):
+        TPI.Spline1D(np.array([0.0, 1.0, 2.0]), F=np.zeros(3))
+    with pytest.raises(ValueError):
+        TPI.Spline1D(np.array([0.0, 1.0, 1.0, 2.0]), F=np.zeros(4))
+    with pytest.raises(ValueError):
+        TPI.Spline1D(x, F=np.zeros(11))
+    with pytest.raises(ValueError):
+        TPI.Spline1D(x, coeffs=np.zeros(13))
+
+    spline = TPI.Spline1D(x, F=F)
+    with pytest.raises(ValueError):
+        spline(np.array([-0.5]))
+    with pytest.raises(ValueError):
+        spline(1.5)
+    values = np.asarray(spline(np.array([0.0, 1.0])))
+    assert np.allclose(values, [F[0], F[-1]], atol=1e-13, rtol=0)
+    single = np.asarray(spline(float(x[3])))
+    assert single.shape == ()
+    assert np.allclose(single, F[3], atol=1e-13, rtol=0)
+
+
 # Hack for running tests since pytest does not import the Cython module under python3
 # Just run: python3 test.py
 '''

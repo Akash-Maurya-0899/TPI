@@ -120,6 +120,18 @@ int TP_Interpolation_ND_Batch(
     int *fail_axis                      // Output: on TPI_FAIL, axis of the range violation
 );
 
+int Spline_1D_Batch_Sorted(
+    double *x,                          // Input: breakpoints (nodes), length n
+    int n,                              // Input: number of breakpoints
+    double *c0,                         // Input: per-interval cubic coefficients, length n-1
+    double *c1,                         //        (value, 1st, 2nd, 3rd order terms in t = xq - x[i])
+    double *c2,
+    double *c3,
+    double *xq,                         // Input: M non-decreasing, in-range query points
+    int M,                              // Input: number of query points
+    double *y                           // Output: spline evaluated at the M points
+);
+
 int TP_Interpolation_ND_Vector_Batch(
     double *v,                          // Input: flattened TP spline coefficient array with
                                         // p contiguous components per grid coefficient

@@ -117,6 +117,18 @@ cdef extern from "TensorProductInterpolation.h":
         int *fail_axis
     ) nogil;
 
+    int Spline_1D_Batch_Sorted(
+        double *x,
+        int n,
+        double *c0,
+        double *c1,
+        double *c2,
+        double *c3,
+        double *xq,
+        int M,
+        double *y
+    ) nogil;
+
     int AssembleSplineMatrix_C(
         gsl_vector *xi,
         gsl_matrix *phi,
@@ -746,3 +758,129 @@ cdef class BsplineBasis1D:
         phi = np.vstack((r1, phi_internal, rm1))
 
         return phi, knots
+
+
+cdef class Spline1D:
+
+    """Dedicated fast 1D cubic spline (not-a-knot) in native Hermite form.
+
+    Construction solves the classic tridiagonal system for the node
+    derivatives (O(n) time and memory, no search anywhere) and stores
+    per-interval polynomial coefficients. Evaluation of a sorted batch of
+    query points uses a monotone span walk in C (O(M + n), GIL released);
+    unsorted batches fall back to a vectorized binary search. Nodes must be
+    strictly increasing with at least 4 points.
+
+    Interop with the TP_Interpolant_ND classes and previously saved data:
+    to_coefficients() exports the standard TPI coefficient vector of shape
+    (n + 2,), and the coeffs= constructor argument loads one (any B-form
+    cubic spline on these nodes, not only not-a-knot interpolants).
+
+    """
+
+    cdef x_arr, c0, c1, c2, c3
+    cdef int n
+    cdef double _x_min, _x_max
+
+    def __init__(self, x, F=None, coeffs=None):
+        """Constructor
+
+        Arguments:
+          * x:      1D array of strictly increasing nodes (at least 4).
+          * F:      (optional) data values at the nodes, shape (len(x),).
+          * coeffs: (optional) standard TPI spline coefficients of shape
+                    (len(x) + 2,), e.g. previously saved with
+                    GetSplineCoefficientsND() or to_coefficients().
+
+        """
+        x_np = TPI_banded.validate_spline1d_nodes(x)
+        self.x_arr = np.ascontiguousarray(x_np)
+        self.n = x_np.shape[0]
+        self._x_min = x_np[0]
+        self._x_max = x_np[-1]
+        self.c0 = None
+        if F is not None and coeffs is not None:
+            raise ValueError("Pass either F or coeffs, not both.")
+        if F is not None:
+            F_np = np.asarray(F, dtype=np.double)
+            if F_np.shape != (self.n,):
+                raise ValueError("Data should have shape [%d]" % self.n)
+            s = TPI_banded.spline1d_derivatives_notaknot(x_np, F_np)
+            self._set_pieces(TPI_banded.hermite_polynomial_pieces(x_np, F_np, s))
+        elif coeffs is not None:
+            coeffs_np = np.asarray(coeffs, dtype=np.double)
+            if coeffs_np.shape != (self.n + 2,):
+                raise ValueError(
+                    "Spline coefficients should have shape [%d]" % (self.n + 2))
+            f, s = TPI_banded.bspline_to_hermite(x_np, coeffs_np)
+            self._set_pieces(TPI_banded.hermite_polynomial_pieces(x_np, f, s))
+
+    def _set_pieces(self, pieces):
+        self.c0, self.c1, self.c2, self.c3 = [
+            np.ascontiguousarray(c, dtype=np.double) for c in pieces]
+
+    def to_coefficients(self):
+        """Standard TPI coefficient vector (shape (n + 2,)) of this spline."""
+        if self.c0 is None:
+            raise ValueError("Spline coefficients have not been set.")
+        return TPI_banded.hermite_to_bspline_coefficients(
+            self.x_arr, self.c0, self.c1, self.c2, self.c3)
+
+    def __call__(self, xq):
+        """Evaluate the spline at query points.
+
+        Arguments:
+          * xq: a scalar or a 1D array of query points inside the node range.
+                Sorted input evaluates with the O(M + n) monotone span walk;
+                unsorted input falls back to a vectorized binary search.
+
+        Returns:
+          * y: the interpolant values, matching the shape of xq.
+
+        """
+        if self.c0 is None:
+            raise ValueError("Spline coefficients have not been set.")
+        xq_np = np.asarray(xq, dtype=np.double)
+        scalar_input = xq_np.ndim == 0
+        if xq_np.ndim > 1:
+            raise ValueError("Query points must be scalar or one-dimensional!")
+        cdef np.ndarray[np.double_t, ndim=1] q = np.ascontiguousarray(
+            np.atleast_1d(xq_np))
+        cdef int M = q.shape[0]
+        if M == 0:
+            return np.empty(0, dtype=np.double)
+
+        cdef np.ndarray[np.double_t, ndim=1] diffs = np.diff(q)
+        is_sorted = bool((diffs >= 0.0).all()) if M > 1 else True
+        if is_sorted:
+            q_min = q[0]
+            q_max = q[M - 1]
+        else:
+            q_min = q.min()
+            q_max = q.max()
+        if q_min < self._x_min or q_max > self._x_max:
+            bad = q_min if q_min < self._x_min else q_max
+            raise ValueError("Spline1D: x = %g is outside of knots vector "
+            "[%g, %g]!" % (bad, self._x_min, self._x_max))
+
+        cdef np.ndarray[np.double_t, ndim=1] y = np.empty(M, dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=1] x_c = self.x_arr
+        cdef np.ndarray[np.double_t, ndim=1] c0 = self.c0
+        cdef np.ndarray[np.double_t, ndim=1] c1 = self.c1
+        cdef np.ndarray[np.double_t, ndim=1] c2 = self.c2
+        cdef np.ndarray[np.double_t, ndim=1] c3 = self.c3
+        cdef int n = self.n
+        if is_sorted:
+            with nogil:
+                Spline_1D_Batch_Sorted(<double*> x_c.data, n,
+                                       <double*> c0.data, <double*> c1.data,
+                                       <double*> c2.data, <double*> c3.data,
+                                       <double*> q.data, M, <double*> y.data)
+        else:
+            idx = np.clip(np.searchsorted(self.x_arr, q, side='right') - 1,
+                          0, n - 2)
+            t = q - self.x_arr[idx]
+            y = self.c0[idx] + t * (self.c1[idx] + t * (self.c2[idx] + t * self.c3[idx]))
+        if scalar_input:
+            return y[0]
+        return y

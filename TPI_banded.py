@@ -220,6 +220,53 @@ def solve_banded_axis(ab, tensor, axis):
     return np.moveaxis(solved.reshape(moved.shape), 0, axis)
 
 
+def validate_spline1d_nodes(x):
+    """Validate nodes for the dedicated 1D path: 1D, n >= 4, strictly increasing."""
+    x_np = np.asarray(x, dtype=np.float64)
+    if x_np.ndim != 1:
+        raise ValueError("Input nodes must be one-dimensional.")
+    if x_np.shape[0] < 4:
+        raise ValueError("Require at least four input nodes for Spline1D.")
+    if not np.isfinite(x_np).all():
+        raise ValueError("Input nodes must be finite.")
+    if (np.diff(x_np) <= 0.0).any():
+        raise ValueError("Input nodes must be strictly increasing for Spline1D.")
+    return x_np
+
+
+def spline1d_derivatives_notaknot(x, f):
+    """Node derivatives of the 1D not-a-knot cubic interpolant.
+
+    Solves the classic tridiagonal system (scipy CubicSpline formulation,
+    not-a-knot rows reduced to tridiagonal form) with scipy's banded solver.
+    The construction performs no search: interval i is known by position.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    f = np.asarray(f, dtype=np.float64)
+    dx = np.diff(x)
+    slope = np.diff(f) / dx
+    n = x.shape[0]
+
+    d_left = x[2] - x[0]
+    d_right = x[-1] - x[-3]
+    dl = np.concatenate(([0.0], dx[1:], [d_right]))
+    diag = np.concatenate((dx[1:2], 2.0 * (dx[:-1] + dx[1:]), dx[-2:-1]))
+    du = np.concatenate(([d_left], dx[:-1], [0.0]))
+    b_left = ((dx[0] + 2.0 * d_left) * dx[1] * slope[0] + dx[0] ** 2 * slope[1]) / d_left
+    b_right = (
+        dx[-1] ** 2 * slope[-2] + (2.0 * d_right + dx[-1]) * dx[-2] * slope[-1]
+    ) / d_right
+    b = np.concatenate(
+        ([b_left], 3.0 * (dx[1:] * slope[:-1] + dx[:-1] * slope[1:]), [b_right])
+    )
+
+    ab = np.zeros((3, n))
+    ab[0, 1:] = du[:-1]
+    ab[1, :] = diag
+    ab[2, :-1] = dl[1:]
+    return solve_banded((1, 1), ab, b, check_finite=False)
+
+
 def hermite_polynomial_pieces(x, f, s):
     """Per-interval cubic coefficients from node values f and derivatives s.
 

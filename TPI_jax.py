@@ -592,19 +592,6 @@ class TP_Interpolant_ND:
         return self.TPInterpolationND(X_arr)
 
 
-def _validate_spline1d_nodes(x):
-    x_np = np.asarray(x, dtype=np.float64)
-    if x_np.ndim != 1:
-        raise ValueError("Input nodes must be one-dimensional.")
-    if x_np.shape[0] < 4:
-        raise ValueError("Require at least four input nodes for Spline1D.")
-    if not np.isfinite(x_np).all():
-        raise ValueError("Input nodes must be finite.")
-    if (np.diff(x_np) <= 0.0).any():
-        raise ValueError("Input nodes must be strictly increasing for Spline1D.")
-    return x_np
-
-
 def spline_1d_hermite(x, F):
     """Per-interval cubic coefficients of the 1D not-a-knot spline, pure JAX.
 
@@ -682,7 +669,7 @@ class Spline1D:
     """
 
     def __init__(self, x, F=None, coeffs=None):
-        x_np = _validate_spline1d_nodes(x)
+        x_np = TPI_banded.validate_spline1d_nodes(x)
         self.x = jnp.asarray(x_np)
         self.n = int(x_np.shape[0])
         # Host-side bounds: reading device arrays per call would force a sync.

@@ -862,3 +862,30 @@ double EvaluateSpline1D(double *c, gsl_bspline_workspace *bw, double xx) {
         sum += c[is + i] * gsl_vector_get(Bx, i);
     return sum;
 }
+
+int Spline_1D_Batch_Sorted(
+    double *x,
+    int n,
+    double *c0,
+    double *c1,
+    double *c2,
+    double *c3,
+    double *xq,
+    int M,
+    double *y
+) {
+    // Evaluate a piecewise cubic with breakpoints x at M non-decreasing query
+    // points. The span index only moves forward (monotone walk), so the whole
+    // batch costs O(M + n) instead of O(M log n) with per-point bisection.
+    // Range checking is the caller's responsibility.
+    int j = 0;
+    const int j_max = n - 2;
+    for (int k = 0; k < M; k++) {
+        const double q = xq[k];
+        while (j < j_max && q >= x[j + 1])
+            j++;
+        const double t = q - x[j];
+        y[k] = c0[j] + t * (c1[j] + t * (c2[j] + t * c3[j]));
+    }
+    return TPI_SUCCESS;
+}
