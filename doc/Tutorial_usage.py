@@ -19,7 +19,8 @@
 #  6. **Large grids and the dedicated fast 1D path (`Spline1D`)** — the
 #     coefficient solve is banded (O(n) memory, hundreds of thousands of
 #     points are fine), and a specialized 1D class squeezes out the last
-#     factors for construction and sorted-batch evaluation.
+#     factors for construction and sorted-batch evaluation, for scalar and
+#     vector/tensor-valued data alike.
 #
 # The file is written in jupytext "percent" format: every `# %%` marker is a
 # code cell and every `# %% [markdown]` marker is a markdown cell, so you can
@@ -445,6 +446,10 @@ print(jac)
 # matrix-valued function; evaluation then returns `(2, 3)` arrays and the
 # coefficients have shape `grid + (2, 3)`. This works in both backends.
 #
+# For **purely 1D grids** the dedicated fast path handles vector/tensor
+# values too — just pass `Spline1D` data with trailing value axes, no
+# separate class needed (section 6.4).
+#
 # ### 4.1 Combining previously saved per-component splines
 #
 # If you already have spline data for each component — built and saved
@@ -812,7 +817,8 @@ if gpu_device is None:
 #    `TP_Interpolant_ND_Vector` is the fastest option by a wide margin.
 #  * **Purely 1D problems:** use `Spline1D` (section 6) — fastest
 #    construction (tridiagonal solve, on-device in JAX) and fastest sorted
-#    batch evaluation (monotone C walk in the GSL backend).
+#    batch evaluation (monotone C walk in the GSL backend). It takes
+#    vector/tensor-valued data directly (section 6.4).
 
 # %% [markdown]
 # ## 6. Large grids and the dedicated fast 1D path (`Spline1D`)
@@ -875,7 +881,8 @@ if gpu_device is None:
 #    evaluator is jit/vmap-compatible and differentiable w.r.t. the query
 #    points.
 #
-# Requirements: strictly increasing nodes, at least 4 of them, scalar values.
+# Requirements: strictly increasing nodes, at least 4 of them. Values may be
+# scalar or vector/tensor-valued (trailing value axes on `F`, section 6.4).
 
 # %%
 s_gsl = TPI.Spline1D(x_large, F=F_large)
@@ -1003,6 +1010,97 @@ _ = build_and_eval(x_large, F_large, xq_sorted[:10])
 print("jitted build+eval:", np.asarray(_)[:3])
 
 # %% [markdown]
+# ### 6.4 Vector- and tensor-valued data in `Spline1D`
+#
+# `Spline1D` interpolates several quantities on the same 1D grid in one
+# object, exactly like `TP_Interpolant_ND_Vector` does for N-D grids
+# (section 4) — but with **no separate class and no `values_shape`
+# argument**. The recipe:
+#
+#  1. Stack your components along *trailing* axes, so `F` has shape
+#     `(len(x),) + values_shape` — e.g. `(n, 3)` for a 3-vector, or
+#     `(n, 2, 3)` for a matrix-valued function. (`np.stack([...], axis=-1)`
+#     does this for per-component arrays.)
+#  2. Construct `Spline1D(x, F=F)` as usual. The value shape is inferred
+#     from the trailing axes of `F`.
+#  3. Evaluate as usual: the result has shape `xq.shape + values_shape` —
+#     a scalar query returns one `values_shape` array, a length-M batch
+#     returns `(M,) + values_shape`.
+#
+# Everything scalar `Spline1D` offers carries over: one shared tridiagonal
+# solve (the components ride along as extra right-hand sides), the O(M + n)
+# monotone C walk for sorted batches (the span walk is shared by all
+# components; GSL backend), on-device construction and differentiability
+# (JAX backend), and fixed-grid refits with `ComputeSplineCoefficients`.
+# Building one 3-component spline costs far less than three scalar ones,
+# and each component matches its scalar spline *exactly* (same arithmetic,
+# same not-a-knot solve):
+
+# %%
+F_vec_large = np.stack(
+    [F_large, np.cos(0.2 * x_large), 0.01 * x_large ** 2], axis=-1)
+print("vector data shape:", F_vec_large.shape, "= (n,) + values_shape")
+
+sv_gsl = TPI.Spline1D(x_large, F=F_vec_large)
+sv_jax = TPI_jax.Spline1D(x_large, F=F_vec_large)
+
+print("scalar query  ->", sv_gsl(50.0).shape, "  batch ->",
+      sv_gsl(xq_sorted[:1000]).shape)
+print("GSL vector Spline1D :", sv_gsl(xq_sorted[:2]))
+print("JAX vector Spline1D :", np.asarray(sv_jax(xq_sorted[:2])))
+print("component 0 == scalar Spline1D:",
+      np.array_equal(sv_gsl(xq_sorted[:1000])[:, 0], s_gsl(xq_sorted[:1000])))
+
+# %% [markdown]
+# How much does sharing buy? Construction and a sorted-batch evaluation of
+# the 3-component spline versus three scalar splines (GSL backend, medians):
+
+# %%
+con_vec = median_ms(lambda: TPI.Spline1D(x_large, F=F_vec_large), repeat=10)
+con_3x = median_ms(
+    lambda: [TPI.Spline1D(x_large, F=F_vec_large[:, k]) for k in range(3)],
+    repeat=10)
+ev_vec = median_ms(sv_gsl, xq_sorted, repeat=10)
+scalar_splines = [TPI.Spline1D(x_large, F=F_vec_large[:, k]) for k in range(3)]
+ev_3x = median_ms(lambda: [s(xq_sorted) for s in scalar_splines], repeat=10)
+print(f"construction: vector {con_vec:6.1f} ms | 3 scalar splines {con_3x:6.1f} ms")
+print(f"evaluation:   vector {ev_vec:6.1f} ms | 3 scalar splines {ev_3x:6.1f} ms")
+
+# %% [markdown]
+# Saving and interop work exactly as in section 6.3, with the value axes
+# riding along: `to_coefficients()` returns shape `(n + 2,) + values_shape`
+# (the same layout `TP_Interpolant_ND_Vector` uses on a 1D grid, so the two
+# classes can exchange coefficients freely), and `coeffs=` loads one.
+# Refitting with `ComputeSplineCoefficients(F_new)` re-infers the value
+# shape from `F_new`, so one instance can switch between scalar and vector
+# data on the same grid:
+
+# %%
+c_vec = sv_gsl.to_coefficients()
+print("coefficients shape:", c_vec.shape)  # (n + 2,) + values_shape
+sv_reloaded = TPI_jax.Spline1D(x_large, coeffs=c_vec)   # cross-backend reload
+fV_from_1d = TPI.TP_Interpolant_ND_Vector([x_large], (3,), coeffs=c_vec)
+print("reload agreement:",
+      np.abs(np.asarray(sv_reloaded(xq_sorted[:1000])) -
+             sv_gsl(xq_sorted[:1000])).max())
+
+# %% [markdown]
+# On the JAX side vector-valued splines stay fully jit/vmap-compatible, the
+# functional core accepts trailing value axes unchanged, and the derivative
+# with respect to the query point is a per-component **Jacobian** — use
+# `jax.jacfwd` (as in section 4) rather than `jax.grad`, since the output
+# is no longer scalar:
+
+# %%
+poly_vec = TPI_jax.spline_1d_hermite(x_large, F_vec_large)  # works under jit too
+print("piece shapes:", [c.shape for c in poly_vec])
+
+dsdx = jax.jit(jax.vmap(jax.jacfwd(sv_jax)))
+# warmup: trigger JIT compilation before inspection
+_ = dsdx(xq_sorted[:8])
+print("d(components)/dx at 3 points:\n", np.asarray(_)[:3])
+
+# %% [markdown]
 # ## Quick reference
 #
 # ```python
@@ -1044,4 +1142,11 @@ print("jitted build+eval:", np.asarray(_)[:3])
 # s2 = TPI.Spline1D(x, coeffs=c)                  # load old saved coefficients
 # poly = TPI_jax.spline_1d_hermite(x, F)          # pure-JAX build (jit/GPU-safe)
 # ys = TPI_jax.spline_1d_evaluate(x, poly, xq)    # pure-JAX eval (grad w.r.t. xq)
+#
+# # --- vector/tensor-valued 1D data: same class, trailing value axes ---
+# sv = TPI.Spline1D(x, F=F_vec)                   # F_vec: (n,) + values_shape
+# sv = TPI_jax.Spline1D(x, F=F_vec)               # (values_shape is inferred)
+# vs = sv(xq)                                     # -> xq.shape + values_shape
+# cv = sv.to_coefficients()                       # -> (n+2,) + values_shape
+# J  = jax.vmap(jax.jacfwd(sv))(xq)               # per-component d/dx  [JAX]
 # ```
