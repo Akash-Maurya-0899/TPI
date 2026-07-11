@@ -601,13 +601,22 @@ def spline_1d_hermite(x, F):
     Sortedness of x is exploited throughout: no search is performed anywhere,
     interval i is known by position.
 
-    Returns (c0, c1, c2, c3), each of length n - 1: the spline on
-    [x[i], x[i+1]] is c0[i] + t*(c1[i] + t*(c2[i] + t*c3[i])), t = xq - x[i].
+    F may carry trailing value axes (vector/tensor-valued data of shape
+    (n,) + values_shape); the value axes ride along as extra right-hand
+    sides of the one shared tridiagonal solve.
+
+    Returns (c0, c1, c2, c3), each of shape (n - 1,) + values_shape: the
+    spline on [x[i], x[i+1]] is c0[i] + t*(c1[i] + t*(c2[i] + t*c3[i])),
+    t = xq - x[i].
     """
     x = jnp.asarray(x, dtype=jnp.float64)
     F = jnp.asarray(F, dtype=jnp.float64)
+    values_shape = F.shape[1:]
+    # One flat trailing RHS axis; (n,) + values_shape is restored at the end.
+    Fv = F.reshape(F.shape[0], -1)
     dx = jnp.diff(x)
-    slope = jnp.diff(F) / dx
+    dxv = dx[:, None]
+    slope = jnp.diff(Fv, axis=0) / dxv
 
     # Not-a-knot boundary rows reduced to tridiagonal form (scipy CubicSpline
     # formulation); interior rows are the standard C^2 continuity conditions.
@@ -623,16 +632,21 @@ def spline_1d_hermite(x, F):
         dx[-1] ** 2 * slope[-2] + (2.0 * d_right + dx[-1]) * dx[-2] * slope[-1]
     ) / d_right
     b = jnp.concatenate(
-        (b_left[None], 3.0 * (dx[1:] * slope[:-1] + dx[:-1] * slope[1:]), b_right[None])
+        (
+            b_left[None],
+            3.0 * (dxv[1:] * slope[:-1] + dxv[:-1] * slope[1:]),
+            b_right[None],
+        )
     )
 
-    s = jax.lax.linalg.tridiagonal_solve(dl, diag, du, b[:, None])[:, 0]
+    s = jax.lax.linalg.tridiagonal_solve(dl, diag, du, b)
 
-    c0 = F[:-1]
+    c0 = Fv[:-1]
     c1 = s[:-1]
-    c2 = (3.0 * slope - 2.0 * s[:-1] - s[1:]) / dx
-    c3 = (s[:-1] + s[1:] - 2.0 * slope) / dx ** 2
-    return c0, c1, c2, c3
+    c2 = (3.0 * slope - 2.0 * s[:-1] - s[1:]) / dxv
+    c3 = (s[:-1] + s[1:] - 2.0 * slope) / dxv ** 2
+    piece_shape = (x.shape[0] - 1,) + values_shape
+    return tuple(c.reshape(piece_shape) for c in (c0, c1, c2, c3))
 
 
 def spline_1d_evaluate(x, poly, xq):
@@ -640,12 +654,16 @@ def spline_1d_evaluate(x, poly, xq):
 
     Differentiable w.r.t. xq and vmap/jit-compatible. Accepts scalar or
     1D xq; the span search is a vectorized searchsorted on the node array.
+    Pieces with trailing value axes yield results of shape
+    xq.shape + values_shape.
     """
     x = jnp.asarray(x, dtype=jnp.float64)
     xq = jnp.asarray(xq, dtype=jnp.float64)
     c0, c1, c2, c3 = poly
     i = jnp.clip(jnp.searchsorted(x, xq, side="right") - 1, 0, x.shape[0] - 2)
     t = xq - x[i]
+    # Broadcast the query axis over any trailing value axes of the pieces.
+    t = t.reshape(t.shape + (1,) * (jnp.ndim(c0) - 1))
     return c0[i] + t * (c1[i] + t * (c2[i] + t * c3[i]))
 
 
@@ -662,10 +680,17 @@ class Spline1D:
     differentiable w.r.t. the query points. Nodes must be strictly
     increasing with at least 4 points.
 
+    Vector/tensor-valued data is supported directly: pass F of shape
+    (len(x),) + values_shape and the value axes ride along as extra
+    right-hand sides of the one shared tridiagonal solve; evaluation
+    returns xq.shape + values_shape. The value shape is inferred from the
+    trailing axes of F (or coeffs).
+
     Interop with the general TP_Interpolant_ND classes and previously saved
-    data: to_coefficients() exports the standard TPI coefficient vector of
-    shape (n + 2,), and the coeffs= constructor argument loads one (any
-    B-form cubic spline on these nodes, not only not-a-knot interpolants).
+    data: to_coefficients() exports the standard TPI coefficient array of
+    shape (n + 2,) + values_shape, and the coeffs= constructor argument
+    loads one (any B-form cubic spline on these nodes, not only not-a-knot
+    interpolants).
     """
 
     def __init__(self, x, F=None, coeffs=None):
@@ -676,6 +701,7 @@ class Spline1D:
         self._x_min = float(x_np[0])
         self._x_max = float(x_np[-1])
         self.poly = None
+        self.values_shape = ()
         self._jit_eval = jax.jit(
             lambda poly, xq: spline_1d_evaluate(self.x, poly, xq)
         )
@@ -685,10 +711,13 @@ class Spline1D:
             self.ComputeSplineCoefficients(F)
         elif coeffs is not None:
             coeffs_np = np.asarray(coeffs, dtype=np.float64)
-            if coeffs_np.shape != (self.n + 2,):
+            if coeffs_np.ndim < 1 or coeffs_np.shape[0] != self.n + 2 \
+                    or coeffs_np.size == 0:
                 raise ValueError(
-                    f"Spline coefficients should have shape [{self.n + 2}]"
+                    f"Spline coefficients should have shape [{self.n + 2}] "
+                    "plus optional trailing value axes."
                 )
+            self.values_shape = coeffs_np.shape[1:]
             f, s = TPI_banded.bspline_to_hermite(x_np, coeffs_np)
             pieces = TPI_banded.hermite_polynomial_pieces(x_np, f, s)
             self.poly = tuple(jnp.asarray(c) for c in pieces)
@@ -702,15 +731,20 @@ class Spline1D:
         evaluator is preserved, so the next evaluation does not retrace.
 
         Arguments:
-          * F: data values at the nodes, shape (len(x),).
+          * F: data values at the nodes, shape (len(x),) + values_shape.
+               The value shape is re-inferred from the trailing axes.
         """
         F_np = np.asarray(F, dtype=np.float64)
-        if F_np.shape != (self.n,):
-            raise ValueError(f"Data should have shape [{self.n}]")
+        if F_np.ndim < 1 or F_np.shape[0] != self.n or F_np.size == 0:
+            raise ValueError(
+                f"Data should have shape [{self.n}] plus optional trailing "
+                "value axes."
+            )
+        self.values_shape = F_np.shape[1:]
         self.poly = _spline_1d_hermite_jit(self.x, jnp.asarray(F_np))
 
     def to_coefficients(self):
-        """Standard TPI coefficient vector (shape (n + 2,)) of this spline."""
+        """Standard TPI coefficients (shape (n + 2,) + values_shape) of this spline."""
         if self.poly is None:
             raise ValueError("Spline coefficients have not been set.")
         c0, c1, c2, c3 = (np.asarray(c) for c in self.poly)

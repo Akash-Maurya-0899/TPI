@@ -2852,6 +2852,258 @@ def test_gsl_Spline1D_node_validation_messages():
     TPI.Spline1D(x, F=nan_F)
 
 
+def _spline1d_vector_case(n=137, values_shape=(3,)):
+    """One vector/tensor-valued 1D dataset: nodes, data with trailing value axes, queries."""
+    rng = np.random.default_rng(42)
+    x = np.sort(rng.uniform(0.0, 10.0, n))
+    x[0], x[-1] = 0.0, 10.0
+    x = np.unique(x)
+    p = int(np.prod(values_shape))
+    flat = np.empty((len(x), p))
+    for k in range(p):
+        flat[:, k] = np.sin((k + 1) * x) * np.exp(-0.05 * (k + 1) * x) + 0.1 * k * x
+    F = flat.reshape((len(x),) + values_shape)
+    xq = np.sort(rng.uniform(x[0], x[-1], 30))
+    return x, F, xq
+
+
+def test_gsl_Spline1D_vector_matches_components_general_and_scipy():
+    from scipy.interpolate import CubicSpline
+
+    for n in (10, 137, 2000):
+        x, F, xq = _spline1d_vector_case(n=n)
+        spline = TPI.Spline1D(x, F=F)
+        actual = np.asarray(spline(xq))
+        assert actual.shape == (len(xq), 3)
+
+        expected_components = np.stack(
+            [np.asarray(TPI.Spline1D(x, F=F[:, k])(xq)) for k in range(3)], axis=-1
+        )
+        print(f"n={len(x)} vs per-component scalar Spline1D:")
+        _print_coefficient_diffs(actual, expected_components)
+        assert np.allclose(actual, expected_components, atol=1e-13, rtol=0)
+
+        general = TPI.TP_Interpolant_ND_Vector([x], (3,), F=F)
+        expected_general = general.TPInterpolationND_batched(xq[:, None])
+        print(f"n={len(x)} vs TP_Interpolant_ND_Vector:")
+        _print_coefficient_diffs(actual, expected_general)
+        assert np.allclose(actual, expected_general, atol=1e-10, rtol=0)
+
+        expected_scipy = CubicSpline(x, F, bc_type="not-a-knot", axis=0)(xq)
+        print(f"n={len(x)} vs scipy CubicSpline:")
+        _print_coefficient_diffs(actual, expected_scipy)
+        assert np.allclose(actual, expected_scipy, atol=1e-10, rtol=0)
+
+        # scalar query point returns the value shape
+        single = np.asarray(spline(float(x[3])))
+        assert single.shape == (3,)
+        assert np.allclose(single, F[3], atol=1e-13, rtol=0)
+
+
+def test_jax_Spline1D_vector_matches_components_general_and_scipy():
+    from scipy.interpolate import CubicSpline
+
+    for n in (10, 137, 2000):
+        x, F, xq = _spline1d_vector_case(n=n)
+        spline = TPI_jax.Spline1D(x, F=F)
+        actual = np.asarray(spline(xq))
+        assert actual.shape == (len(xq), 3)
+
+        expected_components = np.stack(
+            [np.asarray(TPI_jax.Spline1D(x, F=F[:, k])(xq)) for k in range(3)], axis=-1
+        )
+        print(f"n={len(x)} vs per-component scalar Spline1D:")
+        _print_coefficient_diffs(actual, expected_components)
+        assert np.allclose(actual, expected_components, atol=1e-13, rtol=0)
+
+        general = TPI_jax.TP_Interpolant_ND_Vector([x], (3,), F=F)
+        expected_general = np.asarray(general.TPInterpolationND_batched(xq[:, None]))
+        print(f"n={len(x)} vs TP_Interpolant_ND_Vector:")
+        _print_coefficient_diffs(actual, expected_general)
+        assert np.allclose(actual, expected_general, atol=1e-10, rtol=0)
+
+        expected_scipy = CubicSpline(x, F, bc_type="not-a-knot", axis=0)(xq)
+        print(f"n={len(x)} vs scipy CubicSpline:")
+        _print_coefficient_diffs(actual, expected_scipy)
+        assert np.allclose(actual, expected_scipy, atol=1e-10, rtol=0)
+
+        single = np.asarray(spline(float(x[3])))
+        assert single.shape == (3,)
+        assert np.allclose(single, F[3], atol=1e-13, rtol=0)
+
+
+def test_Spline1D_vector_cross_backend_parity():
+    for n in (10, 137, 2000):
+        x, F, xq = _spline1d_vector_case(n=n)
+        cpu = TPI.Spline1D(x, F=F)
+        jax_spline = TPI_jax.Spline1D(x, F=F)
+        actual = np.asarray(cpu(xq))
+        expected = np.asarray(jax_spline(xq))
+        print(f"n={len(x)} CPU vs JAX vector Spline1D:")
+        _print_coefficient_diffs(actual, expected)
+        assert np.allclose(actual, expected, atol=1e-12, rtol=0)
+
+
+def test_Spline1D_tensor_values_shape():
+    x, F, xq = _spline1d_vector_case(values_shape=(2, 3))
+    for module in (TPI, TPI_jax):
+        spline = module.Spline1D(x, F=F)
+        batch = np.asarray(spline(xq))
+        assert batch.shape == (len(xq), 2, 3)
+        single = np.asarray(spline(float(xq[7])))
+        assert single.shape == (2, 3)
+        assert np.allclose(single, batch[7], atol=1e-14, rtol=0)
+
+        # the tensor shape is only a view of the flat component layout
+        flat = module.Spline1D(x, F=F.reshape(len(x), 6))
+        assert np.array_equal(batch.reshape(len(xq), 6), np.asarray(flat(xq)))
+
+        # node values are reproduced
+        idx = np.linspace(0, len(x) - 1, 10).astype(int)
+        vals = np.asarray(spline(x[idx]))
+        print(f"{module.__name__} tensor-valued node reproduction:")
+        _print_coefficient_diffs(vals, F[idx])
+        assert np.allclose(vals, F[idx], atol=1e-13, rtol=0)
+
+
+def test_gsl_Spline1D_vector_sorted_walk_and_unsorted_fallback():
+    from scipy.interpolate import CubicSpline
+
+    x, F, _ = _spline1d_vector_case()
+    spline = TPI.Spline1D(x, F=F)
+    rng = np.random.default_rng(42)
+
+    # duplicate query points, endpoints included, node hits
+    xq = np.sort(np.concatenate((
+        [x[0], x[0], x[-1], x[-1]], x[3:6], [x[4], x[4]],
+        rng.uniform(x[0], x[-1], 21),
+    )))
+    sorted_result = np.asarray(spline(xq))
+
+    # unsorted queries take the fallback path and must agree with the walk
+    perm = rng.permutation(len(xq))
+    unsorted_result = np.asarray(spline(xq[perm]))
+    _print_coefficient_diffs(unsorted_result, sorted_result[perm])
+    assert np.array_equal(unsorted_result, sorted_result[perm])
+
+    reference = CubicSpline(x, F, bc_type="not-a-knot", axis=0)
+    assert np.allclose(sorted_result, reference(xq), atol=1e-12, rtol=0)
+
+
+def test_Spline1D_vector_coefficient_interop():
+    x, F, xq = _spline1d_vector_case()
+    general = TPI.TP_Interpolant_ND_Vector([x], (3,), F=F)
+    expected_coeffs = np.asarray(general.GetSplineCoefficientsND())
+
+    for module in (TPI, TPI_jax):
+        spline = module.Spline1D(x, F=F)
+        coeffs = np.asarray(spline.to_coefficients())
+        assert coeffs.shape == (len(x) + 2, 3)
+        print(f"{module.__name__} to_coefficients vs general vector class:")
+        _print_coefficient_diffs(coeffs, expected_coeffs)
+        assert np.allclose(coeffs, expected_coeffs, atol=1e-10, rtol=0)
+
+        # loading arbitrary vector B-form coefficients matches the general class
+        rng = np.random.default_rng(7)
+        arbitrary = rng.standard_normal((len(x) + 2, 3))
+        loaded = module.Spline1D(x, coeffs=arbitrary)
+        reference = TPI.TP_Interpolant_ND_Vector([x], (3,), coeffs=arbitrary)
+        actual = np.asarray(loaded(xq))
+        expected_eval = reference.TPInterpolationND_batched(xq[:, None])
+        print(f"{module.__name__} coeffs= loading vs general vector class:")
+        _print_coefficient_diffs(actual, expected_eval)
+        assert np.allclose(actual, expected_eval, atol=1e-12, rtol=0)
+
+
+def test_Spline1D_vector_recompute_coefficients_on_fixed_grid():
+    x, F1, xq = _spline1d_vector_case()
+    F2 = np.cos(2.0 * F1) + 0.1 * F1
+
+    for module in (TPI, TPI_jax):
+        spline = module.Spline1D(x, F=F1)
+        spline.ComputeSplineCoefficients(F2)
+        actual = np.asarray(spline(xq))
+        expected = np.asarray(module.Spline1D(x, F=F2)(xq))
+        print(f"{module.__name__} vector refit vs fresh instance:")
+        _print_coefficient_diffs(actual, expected)
+        assert np.array_equal(actual, expected)
+
+        # the value shape is re-inferred from F, so a refit may change it
+        spline.ComputeSplineCoefficients(F2[..., 0])
+        scalar_now = np.asarray(spline(xq))
+        assert scalar_now.shape == (len(xq),)
+        assert np.array_equal(
+            scalar_now, np.asarray(module.Spline1D(x, F=F2[..., 0])(xq))
+        )
+
+        with pytest.raises(ValueError):
+            spline.ComputeSplineCoefficients(np.zeros((len(x) + 1, 3)))
+
+
+def test_jax_Spline1D_vector_jit_vmap_jacobian():
+    from scipy.interpolate import CubicSpline
+
+    x, F, xq = _spline1d_vector_case()
+    spline = TPI_jax.Spline1D(x, F=F)
+    reference = CubicSpline(x, F, bc_type="not-a-knot", axis=0)
+
+    # jit of the functional construction with traced (vector-valued) F
+    build = jax.jit(TPI_jax.spline_1d_hermite)
+    # warmup: trigger JIT compilation before assertions
+    jit_poly = build(jnp_x := jax.numpy.asarray(x), jax.numpy.asarray(F))
+    eager_poly = TPI_jax.spline_1d_hermite(jnp_x, jax.numpy.asarray(F))
+    for k, (jit_c, eager_c) in enumerate(zip(jit_poly, eager_poly)):
+        assert jit_c.shape == (len(x) - 1, 3)
+        # The raw c2/c3 pieces divide a cancellation-prone difference by
+        # dx / dx^2, which amplifies the ~1e-14 jit-vs-eager difference of
+        # the XLA CPU tridiagonal solve; the tolerance scales accordingly.
+        # The evaluated spline is compared at 1e-12 below.
+        atol = 1e-12 / np.min(np.diff(x)) ** max(0, k - 1)
+        assert np.allclose(np.asarray(jit_c), np.asarray(eager_c), atol=atol, rtol=0)
+    jit_values = TPI_jax.spline_1d_evaluate(jnp_x, jit_poly, xq)
+    eager_values = TPI_jax.spline_1d_evaluate(jnp_x, eager_poly, xq)
+    _print_coefficient_diffs(np.asarray(jit_values), np.asarray(eager_values))
+    assert np.allclose(np.asarray(jit_values), np.asarray(eager_values), atol=1e-12, rtol=0)
+
+    # evaluation under jit + vmap over scalar query points -> (M, 3)
+    batched = jax.jit(jax.vmap(lambda q: spline(q)))
+    # warmup: trigger JIT compilation before assertions
+    batched(xq)
+    actual = np.asarray(batched(xq))
+    assert actual.shape == (len(xq), 3)
+    assert np.allclose(actual, np.asarray(spline(xq)), atol=1e-14, rtol=0)
+
+    # Jacobian w.r.t. the query point: finite, correct shape, matches scipy
+    jac_fn = jax.jit(jax.vmap(jax.jacfwd(lambda q: spline(q))))
+    # warmup: trigger JIT compilation before assertions
+    jac_fn(xq)
+    jac = np.asarray(jac_fn(xq))
+    assert jac.shape == (len(xq), 3)
+    assert np.isfinite(jac).all()
+    expected_jac = reference.derivative()(xq)
+    _print_coefficient_diffs(jac, expected_jac)
+    assert np.allclose(jac, expected_jac, atol=1e-8, rtol=0)
+
+
+def test_Spline1D_vector_error_behavior():
+    x = np.linspace(0.0, 1.0, 10)
+    for module in (TPI, TPI_jax):
+        with pytest.raises(ValueError):
+            module.Spline1D(x, F=np.zeros((11, 3)))  # wrong leading (node) axis
+        with pytest.raises(ValueError):
+            module.Spline1D(x, coeffs=np.zeros((13, 3)))  # wrong leading axis
+        with pytest.raises(ValueError):
+            module.Spline1D(x, F=np.zeros((10, 0)))  # empty value axes
+
+        spline = module.Spline1D(x, F=np.zeros((10, 3)))
+        with pytest.raises(ValueError):
+            spline(np.array([-0.5]))
+        with pytest.raises(ValueError):
+            spline(1.5)
+        values = np.asarray(spline(np.array([0.0, 1.0])))
+        assert values.shape == (2, 3)
+
+
 # Hack for running tests since pytest does not import the Cython module under python3
 # Just run: python3 test.py
 '''

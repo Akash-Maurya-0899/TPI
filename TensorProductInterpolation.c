@@ -892,6 +892,41 @@ int Spline_1D_Batch_Sorted(
     return TPI_SUCCESS;
 }
 
+int Spline_1D_Batch_Sorted_Vector(
+    double *x,
+    int n,
+    double *c0,
+    double *c1,
+    double *c2,
+    double *c3,
+    int p,
+    double *xq,
+    int M,
+    double *y
+) {
+    // Vector-valued variant of Spline_1D_Batch_Sorted: the coefficient arrays
+    // carry p contiguous components per interval (row-major (n-1, p)), and
+    // y is M x p row-major. The monotone span walk is shared by all
+    // components; only the Horner evaluation scales with p, on contiguous
+    // rows so the inner loop vectorizes.
+    int j = 0;
+    const int j_max = n - 2;
+    for (int k = 0; k < M; k++) {
+        const double q = xq[k];
+        while (j < j_max && q >= x[j + 1])
+            j++;
+        const double t = q - x[j];
+        const double *a0 = c0 + (size_t)j * p;
+        const double *a1 = c1 + (size_t)j * p;
+        const double *a2 = c2 + (size_t)j * p;
+        const double *a3 = c3 + (size_t)j * p;
+        double *yp = y + (size_t)k * p;
+        for (int c = 0; c < p; c++)
+            yp[c] = a0[c] + t * (a1[c] + t * (a2[c] + t * a3[c]));
+    }
+    return TPI_SUCCESS;
+}
+
 int Spline_1D_NotAKnot_Factor(
     const double *x,
     int n,
@@ -1022,6 +1057,104 @@ int Spline_1D_NotAKnot_Refit(
         c1[i] = work[i];
         c2[i] = (3.0 * slope - 2.0 * work[i] - work[i + 1]) / dx[i];
         c3[i] = (work[i] + work[i + 1] - 2.0 * slope) / (dx[i] * dx[i]);
+    }
+    return TPI_SUCCESS;
+}
+
+int Spline_1D_NotAKnot_Refit_Vector(
+    const double *x,
+    const double *dx,
+    int n,
+    const double *dl,
+    const double *d,
+    const double *du,
+    const double *du2,
+    const int *piv,
+    const double *f,
+    int p,
+    double *work,
+    double *c0,
+    double *c1,
+    double *c2,
+    double *c3
+) {
+    // Vector-valued variant of Spline_1D_NotAKnot_Refit: f is (n, p)
+    // row-major (p contiguous components per node) and the value axes ride
+    // along as extra right-hand sides of the one shared LU substitution.
+    // The per-component arithmetic and its ordering are identical to the
+    // scalar routine, so each component matches a scalar refit of that
+    // component exactly. work is (n, p); c0..c3 are (n-1, p). All inner
+    // loops run over contiguous component rows so they vectorize.
+    const double d_left = x[2] - x[0];
+    const double d_right = x[n - 1] - x[n - 3];
+
+    // Interval slopes, staged in c3 until the cubic coefficients overwrite it.
+    for (int i = 0; i < n - 1; i++) {
+        const double *fi = f + (size_t)i * p;
+        double *si = c3 + (size_t)i * p;
+        for (int c = 0; c < p; c++)
+            si[c] = (fi[p + c] - fi[c]) / dx[i];
+    }
+
+    for (int c = 0; c < p; c++)
+        work[c] = ((dx[0] + 2.0 * d_left) * dx[1] * c3[c]
+                   + dx[0] * dx[0] * c3[p + c]) / d_left;
+    for (int i = 1; i < n - 1; i++) {
+        const double *sm = c3 + (size_t)(i - 1) * p;
+        double *wi = work + (size_t)i * p;
+        for (int c = 0; c < p; c++)
+            wi[c] = 3.0 * (dx[i] * sm[c] + dx[i - 1] * sm[p + c]);
+    }
+    {
+        const double *sm = c3 + (size_t)(n - 3) * p;
+        double *wl = work + (size_t)(n - 1) * p;
+        for (int c = 0; c < p; c++)
+            wl[c] = (dx[n - 2] * dx[n - 2] * sm[c]
+                     + (2.0 * d_right + dx[n - 2]) * dx[n - 3] * sm[p + c]) / d_right;
+    }
+
+    // Forward and back substitution (LAPACK dgtts2 scheme).
+    for (int i = 0; i < n - 1; i++) {
+        double *wi = work + (size_t)i * p;
+        if (piv[i] == 0) {
+            for (int c = 0; c < p; c++)
+                wi[p + c] -= dl[i] * wi[c];
+        } else {
+            for (int c = 0; c < p; c++) {
+                const double temp = wi[c];
+                wi[c] = wi[p + c];
+                wi[p + c] = temp - dl[i] * wi[c];
+            }
+        }
+    }
+    {
+        double *wl = work + (size_t)(n - 1) * p;
+        for (int c = 0; c < p; c++)
+            wl[c] /= d[n - 1];
+        double *wm = work + (size_t)(n - 2) * p;
+        for (int c = 0; c < p; c++)
+            wm[c] = (wm[c] - du[n - 2] * wm[p + c]) / d[n - 2];
+    }
+    for (int i = n - 3; i >= 0; i--) {
+        double *wi = work + (size_t)i * p;
+        for (int c = 0; c < p; c++)
+            wi[c] = (wi[c] - du[i] * wi[p + c] - du2[i] * wi[2 * p + c]) / d[i];
+    }
+
+    for (int i = 0; i < n - 1; i++) {
+        const double *fi = f + (size_t)i * p;
+        const double *wi = work + (size_t)i * p;
+        double *a0 = c0 + (size_t)i * p;
+        double *a1 = c1 + (size_t)i * p;
+        double *a2 = c2 + (size_t)i * p;
+        double *a3 = c3 + (size_t)i * p;
+        for (int c = 0; c < p; c++) {
+            const double slope = a3[c];
+            a0[c] = fi[c];
+            a1[c] = wi[c];
+            a2[c] = (3.0 * slope - 2.0 * wi[c] - wi[p + c]) / dx[i];
+            a3[c] = (wi[c] + wi[p + c] - 2.0 * slope) / (dx[i] * dx[i]);
+        }
     }
     return TPI_SUCCESS;
 }

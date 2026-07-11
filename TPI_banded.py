@@ -285,17 +285,25 @@ def spline1d_derivatives_notaknot(x, f, system=None):
     return solve_banded((1, 1), ab, b, check_finite=False)
 
 
+def _expand_value_axes(a, values_ndim):
+    """Append length-1 axes so a node-axis array broadcasts over value axes."""
+    a = np.asarray(a)
+    return a.reshape(a.shape + (1,) * values_ndim)
+
+
 def hermite_polynomial_pieces(x, f, s):
     """Per-interval cubic coefficients from node values f and derivatives s.
 
     Returns (c0, c1, c2, c3), each of length n - 1, such that the spline on
     [x_i, x_{i+1}] is c0[i] + t*(c1[i] + t*(c2[i] + t*c3[i])) with t = x - x_i.
+    f and s may carry trailing value axes (vector/tensor-valued splines); the
+    pieces then carry the same trailing axes.
     """
     x = np.asarray(x, dtype=np.float64)
     f = np.asarray(f, dtype=np.float64)
     s = np.asarray(s, dtype=np.float64)
-    dx = np.diff(x)
-    slope = np.diff(f) / dx
+    dx = _expand_value_axes(np.diff(x), f.ndim - 1)
+    slope = np.diff(f, axis=0) / dx
     c0 = f[:-1]
     c1 = s[:-1]
     c2 = (3.0 * slope - 2.0 * s[:-1] - s[1:]) / dx
@@ -308,16 +316,18 @@ def hermite_to_bspline_coefficients(x, c0, c1, c2, c3):
 
     Uses the polar form (blossom) of the cubic pieces: coefficient j equals
     the blossom evaluated at knots t_{j+1}, t_{j+2}, t_{j+3}, computed on a
-    polynomial piece whose interval touches those knots.
+    polynomial piece whose interval touches those knots. The pieces may carry
+    trailing value axes; the coefficients then carry the same trailing axes.
     """
     x = np.asarray(x, dtype=np.float64)
     n = x.shape[0]
     t = construct_knots(x)
     j = np.arange(n + 2)
     piece = np.clip(j, 3, n + 1) - 3
-    u = t[j + 1] - x[piece]
-    v = t[j + 2] - x[piece]
-    w = t[j + 3] - x[piece]
+    values_ndim = np.asarray(c0).ndim - 1
+    u = _expand_value_axes(t[j + 1] - x[piece], values_ndim)
+    v = _expand_value_axes(t[j + 2] - x[piece], values_ndim)
+    w = _expand_value_axes(t[j + 3] - x[piece], values_ndim)
     p0 = np.asarray(c0)[piece]
     p1 = np.asarray(c1)[piece]
     p2 = np.asarray(c2)[piece]
@@ -337,22 +347,24 @@ def bspline_to_hermite(x, coeffs):
     cubic spline in B-form), not only not-a-knot interpolants: values come
     from the 4 active cubic basis functions per node, derivatives from the
     quadratic B-form of the derivative spline. Requires strictly increasing
-    nodes.
+    nodes. The coefficients may carry trailing value axes; f and s then carry
+    the same trailing axes.
     """
     x = np.asarray(x, dtype=np.float64)
     coeffs = np.asarray(coeffs, dtype=np.float64)
     n = x.shape[0]
     N = n + 2
     t = construct_knots(x)
+    values_ndim = coeffs.ndim - 1
 
     basis4, starts = active_basis_at_nodes(x)
     idx = starts[:, None] + np.arange(4)
-    f = np.sum(basis4 * coeffs[idx], axis=1)
+    f = np.sum(_expand_value_axes(basis4, values_ndim) * coeffs[idx], axis=1)
 
     # Derivative spline: quadratic B-form with coefficients e_j (j = 1..N-1)
-    e = np.zeros(N)
+    e = np.zeros(coeffs.shape)
     jj = np.arange(1, N)
-    e[1:] = 3.0 * (coeffs[1:] - coeffs[:-1]) / (t[jj + 3] - t[jj])
+    e[1:] = 3.0 * (coeffs[1:] - coeffs[:-1]) / _expand_value_axes(t[jj + 3] - t[jj], values_ndim)
 
     # The 3 active quadratic basis values at each node (de Boor, degree 2)
     spans = np.minimum(np.arange(n) + 3, n + 1)
@@ -369,9 +381,9 @@ def bspline_to_hermite(x, coeffs):
 
     qidx = spans[:, None] + np.arange(-2, 1)
     s = (
-        q0 * e[qidx[:, 0]]
-        + q1 * e[qidx[:, 1]]
-        + q2 * e[qidx[:, 2]]
+        _expand_value_axes(q0, values_ndim) * e[qidx[:, 0]]
+        + _expand_value_axes(q1, values_ndim) * e[qidx[:, 1]]
+        + _expand_value_axes(q2, values_ndim) * e[qidx[:, 2]]
     )
     return f, s
 

@@ -132,6 +132,37 @@ cdef extern from "TensorProductInterpolation.h":
         double *y
     ) nogil;
 
+    int Spline_1D_Batch_Sorted_Vector(
+        double *x,
+        int n,
+        double *c0,
+        double *c1,
+        double *c2,
+        double *c3,
+        int p,
+        double *xq,
+        int M,
+        double *y
+    ) nogil;
+
+    int Spline_1D_NotAKnot_Refit_Vector(
+        const double *x,
+        const double *dx,
+        int n,
+        const double *dl,
+        const double *d,
+        const double *du,
+        const double *du2,
+        const int *piv,
+        const double *f,
+        int p,
+        double *work,
+        double *c0,
+        double *c1,
+        double *c2,
+        double *c3
+    ) nogil;
+
     int Spline_1D_NotAKnot_Factor(
         const double *x,
         int n,
@@ -803,15 +834,25 @@ cdef class Spline1D:
     unsorted batches fall back to a vectorized binary search. Nodes must be
     strictly increasing with at least 4 points.
 
+    Vector/tensor-valued data is supported directly: pass F of shape
+    (len(x),) + values_shape and the value axes ride along as extra
+    right-hand sides of the one shared tridiagonal solve; evaluation
+    returns xq.shape + values_shape. The value shape is inferred from the
+    trailing axes of F (or coeffs); the span walk and LU substitution are
+    shared across all components.
+
     Interop with the TP_Interpolant_ND classes and previously saved data:
-    to_coefficients() exports the standard TPI coefficient vector of shape
-    (n + 2,), and the coeffs= constructor argument loads one (any B-form
-    cubic spline on these nodes, not only not-a-knot interpolants).
+    to_coefficients() exports the standard TPI coefficient array of shape
+    (n + 2,) + values_shape, and the coeffs= constructor argument loads one
+    (any B-form cubic spline on these nodes, not only not-a-knot
+    interpolants).
 
     """
 
     cdef x_arr, c0, c1, c2, c3
     cdef _factors
+    cdef _values_shape
+    cdef int _values_size
     cdef int n
     cdef double _x_min, _x_max
 
@@ -820,9 +861,10 @@ cdef class Spline1D:
 
         Arguments:
           * x:      1D array of strictly increasing nodes (at least 4).
-          * F:      (optional) data values at the nodes, shape (len(x),).
+          * F:      (optional) data values at the nodes, shape
+                    (len(x),) + values_shape (trailing value axes optional).
           * coeffs: (optional) standard TPI spline coefficients of shape
-                    (len(x) + 2,), e.g. previously saved with
+                    (len(x) + 2,) + values_shape, e.g. previously saved with
                     GetSplineCoefficientsND() or to_coefficients().
 
         """
@@ -837,6 +879,8 @@ cdef class Spline1D:
         self._x_max = x_np[-1]
         self.c0 = None
         self._factors = None
+        self._values_shape = ()
+        self._values_size = 1
         if F is not None and coeffs is not None:
             raise ValueError("Pass either F or coeffs, not both.")
         if F is not None:
@@ -847,13 +891,22 @@ cdef class Spline1D:
             TPI_banded.validate_spline1d_nodes(x_np)
             if coeffs is not None:
                 coeffs_np = np.asarray(coeffs, dtype=np.double)
-                if coeffs_np.shape != (self.n + 2,):
+                if coeffs_np.ndim < 1 or coeffs_np.shape[0] != self.n + 2 \
+                        or coeffs_np.size == 0:
                     raise ValueError(
-                        "Spline coefficients should have shape [%d]" % (self.n + 2))
+                        "Spline coefficients should have shape [%d] plus "
+                        "optional trailing value axes." % (self.n + 2))
+                self._values_shape = coeffs_np.shape[1:]
+                self._values_size = int(np.prod(self._values_shape, dtype=np.int64))
                 f, s = TPI_banded.bspline_to_hermite(x_np, coeffs_np)
                 self._set_pieces(TPI_banded.hermite_polynomial_pieces(x_np, f, s))
 
     def _set_pieces(self, pieces):
+        # Pieces are stored flat: (n-1,) for scalar values, (n-1, p) row-major
+        # for vector/tensor values (p contiguous components per interval), as
+        # expected by the C kernels. values_shape is only applied to outputs.
+        if self._values_shape:
+            pieces = [np.reshape(c, (self.n - 1, self._values_size)) for c in pieces]
         self.c0, self.c1, self.c2, self.c3 = [
             np.ascontiguousarray(c, dtype=np.double) for c in pieces]
 
@@ -897,14 +950,22 @@ cdef class Spline1D:
         substitution. Everything runs in C with the GIL released.
 
         Arguments:
-          * F: data values at the nodes, shape (len(x),).
+          * F: data values at the nodes, shape (len(x),) + values_shape.
+               The value shape is re-inferred from the trailing axes.
 
         """
         F_np = np.asarray(F, dtype=np.double)
-        if F_np.shape != (self.n,):
-            raise ValueError("Data should have shape [%d]" % self.n)
+        if F_np.ndim < 1 or F_np.shape[0] != self.n or F_np.size == 0:
+            raise ValueError("Data should have shape [%d] plus optional "
+                             "trailing value axes." % self.n)
         if self._factors is None:
             self._factor_nodes()
+        self._values_shape = F_np.shape[1:]
+        self._values_size = int(np.prod(self._values_shape, dtype=np.int64))
+        if self._values_shape:
+            self._refit_vector(np.ascontiguousarray(
+                F_np.reshape(self.n, self._values_size)))
+            return
         cdef np.ndarray[np.double_t, ndim=1] f_c = np.ascontiguousarray(F_np)
         cdef np.ndarray[np.double_t, ndim=1] x_c = self.x_arr
         cdef np.ndarray[np.double_t, ndim=1] dx = self._factors[0]
@@ -929,12 +990,47 @@ cdef class Spline1D:
                                      <double*> c2.data, <double*> c3.data)
         self.c0, self.c1, self.c2, self.c3 = c0, c1, c2, c3
 
+    def _refit_vector(self, np.ndarray[np.double_t, ndim=2] f_c):
+        """Vector-valued refit on the cached LU factors.
+
+        f_c is the data flattened to (n, p) row-major; the value axes ride
+        along as extra right-hand sides of the one shared substitution, with
+        per-component arithmetic identical to the scalar refit. Runs in C
+        with the GIL released.
+        """
+        cdef int p = self._values_size
+        cdef np.ndarray[np.double_t, ndim=1] x_c = self.x_arr
+        cdef np.ndarray[np.double_t, ndim=1] dx = self._factors[0]
+        cdef np.ndarray[np.double_t, ndim=1] dl = self._factors[1]
+        cdef np.ndarray[np.double_t, ndim=1] d = self._factors[2]
+        cdef np.ndarray[np.double_t, ndim=1] du = self._factors[3]
+        cdef np.ndarray[np.double_t, ndim=1] du2 = self._factors[4]
+        cdef np.ndarray[np.int32_t, ndim=1] piv = self._factors[5]
+        cdef np.ndarray[np.double_t, ndim=2] work = np.empty((self.n, p), dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=2] c0 = np.empty((self.n - 1, p), dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=2] c1 = np.empty((self.n - 1, p), dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=2] c2 = np.empty((self.n - 1, p), dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=2] c3 = np.empty((self.n - 1, p), dtype=np.double)
+        cdef int n = self.n
+        with nogil:
+            Spline_1D_NotAKnot_Refit_Vector(<double*> x_c.data, <double*> dx.data,
+                                            n, <double*> dl.data, <double*> d.data,
+                                            <double*> du.data, <double*> du2.data,
+                                            <int*> piv.data, <double*> f_c.data,
+                                            p, <double*> work.data,
+                                            <double*> c0.data, <double*> c1.data,
+                                            <double*> c2.data, <double*> c3.data)
+        self.c0, self.c1, self.c2, self.c3 = c0, c1, c2, c3
+
     def to_coefficients(self):
-        """Standard TPI coefficient vector (shape (n + 2,)) of this spline."""
+        """Standard TPI coefficients (shape (n + 2,) + values_shape) of this spline."""
         if self.c0 is None:
             raise ValueError("Spline coefficients have not been set.")
+        piece_shape = (self.n - 1,) + self._values_shape
         return TPI_banded.hermite_to_bspline_coefficients(
-            self.x_arr, self.c0, self.c1, self.c2, self.c3)
+            self.x_arr,
+            self.c0.reshape(piece_shape), self.c1.reshape(piece_shape),
+            self.c2.reshape(piece_shape), self.c3.reshape(piece_shape))
 
     def __call__(self, xq):
         """Evaluate the spline at query points.
@@ -945,7 +1041,7 @@ cdef class Spline1D:
                 unsorted input falls back to a vectorized binary search.
 
         Returns:
-          * y: the interpolant values, matching the shape of xq.
+          * y: the interpolant values, shape xq.shape + values_shape.
 
         """
         if self.c0 is None:
@@ -958,7 +1054,7 @@ cdef class Spline1D:
             np.atleast_1d(xq_np))
         cdef int M = q.shape[0]
         if M == 0:
-            return np.empty(0, dtype=np.double)
+            return np.empty((0,) + self._values_shape, dtype=np.double)
 
         cdef np.ndarray[np.double_t, ndim=1] diffs = np.diff(q)
         is_sorted = bool((diffs >= 0.0).all()) if M > 1 else True
@@ -972,6 +1068,9 @@ cdef class Spline1D:
             bad = q_min if q_min < self._x_min else q_max
             raise ValueError("Spline1D: x = %g is outside of knots vector "
             "[%g, %g]!" % (bad, self._x_min, self._x_max))
+
+        if self._values_shape:
+            return self._evaluate_vector(q, M, is_sorted, scalar_input)
 
         cdef np.ndarray[np.double_t, ndim=1] y = np.empty(M, dtype=np.double)
         cdef np.ndarray[np.double_t, ndim=1] x_c = self.x_arr
@@ -994,3 +1093,34 @@ cdef class Spline1D:
         if scalar_input:
             return y[0]
         return y
+
+    def _evaluate_vector(self, np.ndarray[np.double_t, ndim=1] q, int M,
+                         is_sorted, scalar_input):
+        """Vector-valued evaluation of a validated, in-range query batch.
+
+        The monotone span walk is shared across all value components; only
+        the per-interval Horner evaluation scales with the component count.
+        """
+        cdef int p = self._values_size
+        cdef np.ndarray[np.double_t, ndim=2] y = np.empty((M, p), dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=1] x_c = self.x_arr
+        cdef np.ndarray[np.double_t, ndim=2] c0 = self.c0
+        cdef np.ndarray[np.double_t, ndim=2] c1 = self.c1
+        cdef np.ndarray[np.double_t, ndim=2] c2 = self.c2
+        cdef np.ndarray[np.double_t, ndim=2] c3 = self.c3
+        cdef int n = self.n
+        if is_sorted:
+            with nogil:
+                Spline_1D_Batch_Sorted_Vector(<double*> x_c.data, n,
+                                              <double*> c0.data, <double*> c1.data,
+                                              <double*> c2.data, <double*> c3.data,
+                                              p, <double*> q.data, M,
+                                              <double*> y.data)
+        else:
+            idx = np.clip(np.searchsorted(self.x_arr, q, side='right') - 1,
+                          0, n - 2)
+            t = (q - self.x_arr[idx])[:, None]
+            y = self.c0[idx] + t * (self.c1[idx] + t * (self.c2[idx] + t * self.c3[idx]))
+        if scalar_input:
+            return y[0].reshape(self._values_shape)
+        return y.reshape((M,) + self._values_shape)

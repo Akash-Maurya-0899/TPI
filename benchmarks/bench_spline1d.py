@@ -136,6 +136,52 @@ def bench_evaluation(x, F, xq):
     print(f"  max |TPI_jax - scipy|: {err_jax:.3e}")
 
 
+def bench_vector(x, xq, p=3):
+    """Vector-valued Spline1D (trailing value axes) vs p scalar splines."""
+    from scipy.interpolate import CubicSpline
+
+    Fv = np.stack(
+        [np.sin((k + 1) * 0.05 * x) * np.exp(-0.01 * (k + 1) * x) for k in range(p)],
+        axis=-1,
+    )
+
+    print()
+    print(f"Vector-valued splines, n = {len(x)}, values_shape = ({p},) "
+          "(median of 20, steady-state):")
+
+    t_con = _median_ms(lambda: TPI.Spline1D(x, F=Fv))
+    t_con_scalar = _median_ms(
+        lambda: [TPI.Spline1D(x, F=Fv[:, k]) for k in range(p)])
+    print(f"  construction  TPI.Spline1D vector:    {t_con:8.2f} ms"
+          f"   ({p} scalar splines: {t_con_scalar:.2f} ms)")
+
+    warm = TPI.Spline1D(x, F=Fv)
+    t_refit = _median_ms(lambda: warm.ComputeSplineCoefficients(Fv))
+    print(f"  refit         TPI.Spline1D vector:    {t_refit:8.2f} ms")
+
+    t_ev = _median_ms(lambda: warm(xq))
+    scalars = [TPI.Spline1D(x, F=Fv[:, k]) for k in range(p)]
+    t_ev_scalar = _median_ms(lambda: [s(xq) for s in scalars])
+    print(f"  eval M={len(xq)}  TPI.Spline1D vector:    {t_ev:8.2f} ms"
+          f"   ({p} scalar splines: {t_ev_scalar:.2f} ms)")
+
+    jax_vec = TPI_jax.Spline1D(x, F=Fv)
+    jax_vec(xq)  # warmup: trigger JIT compilation before timing
+    t_jax_con = _median_ms_blocking(lambda: TPI_jax.Spline1D(x, F=Fv).poly)
+    t_jax_ev = _median_ms_blocking(lambda: jax_vec(xq))
+    print(f"  construction  TPI_jax.Spline1D vector ({jax.default_backend()}): {t_jax_con:8.2f} ms")
+    print(f"  eval          TPI_jax.Spline1D vector ({jax.default_backend()}): {t_jax_ev:8.2f} ms")
+
+    reference = CubicSpline(x, Fv, bc_type="not-a-knot", axis=0)
+    t_scipy_ev = _median_ms(lambda: reference(xq))
+    print(f"  eval          scipy CubicSpline (PPoly, axis=0): {t_scipy_ev:6.2f} ms")
+
+    err_gsl = np.max(np.abs(np.asarray(warm(xq)) - reference(xq)))
+    err_jax = np.max(np.abs(np.asarray(jax_vec(xq)) - reference(xq)))
+    print(f"  accuracy: max |TPI - scipy| = {err_gsl:.3e}, "
+          f"max |TPI_jax - scipy| = {err_jax:.3e}")
+
+
 def main():
     print("Environment:")
     jax.print_environment_info()
@@ -143,6 +189,7 @@ def main():
     x, F, xq = _grids()
     bench_construction(x, F)
     bench_evaluation(x, F, xq)
+    bench_vector(x, xq)
 
 
 if __name__ == "__main__":
