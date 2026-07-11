@@ -12,8 +12,10 @@
 #     how `jit`, `vmap`, and `grad` change the game.
 #  4. **Vector/tensor-valued interpolation** (both backends), including how to
 #     combine previously saved per-component splines into one vectorized spline.
-#  5. **Benchmarks** for construction and evaluation, with plain-language
-#     explanations of what each number actually measures.
+#  5. **Benchmarks** for construction and evaluation — on the CPU and, when
+#     one is available, on the GPU — with plain-language explanations of
+#     what each number actually measures. On machines without a GPU the
+#     GPU rows print a message saying they were not run.
 #  6. **Large grids and the dedicated fast 1D path (`Spline1D`)** — the
 #     coefficient solve is banded (O(n) memory, hundreds of thousands of
 #     points are fine), and a specialized 1D class squeezes out the last
@@ -44,6 +46,11 @@ import sys
 import time
 import statistics
 
+# On GPU machines JAX preallocates 75% of the device memory by default.
+# Opting out keeps this tutorial friendly to shared GPUs; it must happen
+# before JAX is imported.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import numpy as np
 
 # Make the repository importable when running this file from the doc/ directory
@@ -73,6 +80,47 @@ import jax
 import jax.numpy as jnp
 
 import TPI_jax   # JAX backend; enables 64-bit mode on import
+
+# %% [markdown]
+# ## A note on devices: CPU and GPU
+#
+# JAX runs on whatever accelerator its installed backend supports. With a
+# CPU-only install there is exactly one device; with a CUDA install the
+# **GPU becomes the default device**, and every JAX array and computation
+# lands there unless placed explicitly. The Cython/GSL backend always runs
+# on the CPU.
+#
+# This tutorial demonstrates and benchmarks the JAX backend on **both** CPU
+# and GPU. Explicit placement uses two tools:
+#
+#  * `jax.device_put(arr, device)` copies an array to a device; computations
+#    follow their operands.
+#  * `with jax.default_device(device): ...` makes every array created inside
+#    the block live on that device — we use it to build per-device
+#    interpolants.
+#
+# The cell below discovers the available devices once. Every GPU cell in this
+# tutorial is guarded by it: on a machine without a GPU it prints a message
+# instead of numbers, and everything else still runs.
+
+# %%
+cpu_device = jax.devices("cpu")[0]
+try:
+    gpu_device = jax.devices("gpu")[0]
+except RuntimeError:
+    gpu_device = None
+
+jax_devices = {"cpu": cpu_device}
+if gpu_device is not None:
+    jax_devices["gpu"] = gpu_device
+
+def gpu_skip_message():
+    print("GPU benchmarks were not run as there was no GPU present on this machine.")
+
+print("default JAX device:     ", jax.devices()[0])
+print("benchmarked JAX devices:", list(jax_devices))
+if gpu_device is None:
+    gpu_skip_message()
 
 # %% [markdown]
 # ## 1. Creating splines
@@ -130,8 +178,34 @@ print("JAX spline:  ", float(fI_jax(point)))
 print("GSL vs JAX:  ", float(fI_jax(point)) - fI_gsl(point))
 
 # %% [markdown]
+# On a GPU machine the interpolant above already lives on the GPU — it was
+# built on the default device. To pin a spline to a specific device,
+# construct it under `jax.default_device`; evaluation then runs on that
+# device no matter where it is called from. We build one interpolant per
+# available device here and reuse them in the benchmarks of section 5:
+
+# %%
+with jax.default_device(cpu_device):
+    fI_jax_cpu = TPI_jax.TP_Interpolant_ND(nodes, F=F)
+
+if gpu_device is not None:
+    with jax.default_device(gpu_device):
+        fI_jax_gpu = TPI_jax.TP_Interpolant_ND(nodes, F=F)
+    point_dev = jax.device_put(jnp.asarray(point), gpu_device)
+    print("CPU spline:", float(fI_jax_cpu(point)))
+    print("GPU spline:", float(fI_jax_gpu(point_dev)))
+    print("CPU vs GPU:", float(fI_jax_cpu(point)) - float(fI_jax_gpu(point_dev)))
+else:
+    fI_jax_gpu = None
+    print("No GPU present - the JAX backend runs on the CPU on this machine.")
+
+fI_jax_dev = {"cpu": fI_jax_cpu}
+if fI_jax_gpu is not None:
+    fI_jax_dev["gpu"] = fI_jax_gpu
+
+# %% [markdown]
 # The two backends agree to ~1e-15 (floating-point roundoff); the underlying
-# algorithm — not-a-knot cubic B-splines — is the same.
+# algorithm — not-a-knot cubic B-splines — is the same, on every device.
 #
 # ### Aside: the 1D building blocks
 #
@@ -251,9 +325,10 @@ except ValueError as exc:
 #
 # Two consequences worth internalizing:
 #
-#  * A single call from Python always pays a fixed dispatch cost (~10-20 µs)
-#    to hand control from Python to the compiled code. For one point in low
-#    dimensions the Cython backend (~1-3 µs) therefore stays faster.
+#  * A single call from Python always pays a fixed dispatch cost — tens of
+#    microseconds on a CPU-only install, and up to a millisecond when a GPU
+#    backend is active (device synchronization dominates). For one point in
+#    low dimensions the Cython backend (~1-3 µs) therefore stays faster.
 #  * **Inside** a jitted function, that dispatch cost vanishes: the spline
 #    evaluation is inlined and fused into your surrounding computation. This
 #    is the intended way to use the JAX backend in a JAX codebase — the
@@ -420,7 +495,12 @@ fI_reloaded = TPI_jax.TP_Interpolant_ND_Vector(nodes, values_shape=(3,), coeffs=
 #    the result while the computation may still be running. Timing naively
 #    would measure how fast JAX *queues* work, not how fast it *does* work.
 #    `jax.block_until_ready(...)` waits for completion, so all timings below
-#    include the actual computation.
+#    include the actual computation. This matters doubly on a GPU, where the
+#    computation runs on a physically separate processor.
+#
+# Every JAX benchmark below reports one row per available device (the
+# per-device interpolants were built in section 1). On a machine without a
+# GPU, the GPU rows are replaced by a message saying they were not run.
 #  * **Median, not mean.** Operating-system hiccups make individual timings
 #    spiky; the median of many repetitions is a robust "typical cost".
 
@@ -456,13 +536,16 @@ def once_ms(fn, *args):
 # %%
 gsl_construct = median_ms(lambda: TPI.TP_Interpolant_ND(nodes, F=F), repeat=20)
 
-jax_construct_first = once_ms(lambda: TPI_jax.TP_Interpolant_ND(nodes, F=F))
-jax_construct = median_ms(lambda: TPI_jax.TP_Interpolant_ND(nodes, F=F), repeat=20)
-
 print(f"construction, 3D grid {F.shape}:")
 print(f"  GSL/Cython                {gsl_construct:8.3f} ms")
-print(f"  JAX (first in process)    {jax_construct_first:8.3f} ms")
-print(f"  JAX (steady)              {jax_construct:8.3f} ms")
+for dev_name, dev in jax_devices.items():
+    with jax.default_device(dev):
+        first = once_ms(lambda: TPI_jax.TP_Interpolant_ND(nodes, F=F))
+        steady = median_ms(lambda: TPI_jax.TP_Interpolant_ND(nodes, F=F), repeat=20)
+    print(f"  JAX on {dev_name} (first)        {first:8.3f} ms")
+    print(f"  JAX on {dev_name} (steady)       {steady:8.3f} ms")
+if gpu_device is None:
+    gpu_skip_message()
 
 # %% [markdown]
 # If you rebuild coefficients repeatedly on a *fixed grid* (e.g. fitting many
@@ -473,8 +556,12 @@ print(f"  JAX (steady)              {jax_construct:8.3f} ms")
 
 # %%
 gsl_solve = median_ms(fI_gsl.ComputeSplineCoefficientsND, F, repeat=20)
-jax_solve = median_ms(fI_jax.ComputeSplineCoefficientsND, F, repeat=20)
-print(f"coefficient solve only:  GSL {gsl_solve:7.3f} ms | JAX {jax_solve:7.3f} ms")
+print(f"coefficient solve only:  GSL {gsl_solve:7.3f} ms")
+for dev_name, fI in fI_jax_dev.items():
+    jax_solve = median_ms(fI.ComputeSplineCoefficientsND, F, repeat=20)
+    print(f"                         JAX on {dev_name} {jax_solve:7.3f} ms")
+if gpu_device is None:
+    gpu_skip_message()
 
 # %% [markdown]
 # ### 5.2 Single-point evaluation
@@ -489,12 +576,19 @@ print(f"coefficient solve only:  GSL {gsl_solve:7.3f} ms | JAX {jax_solve:7.3f} 
 #    this is the latency floor for one-at-a-time calls from Python.
 #  * **JAX single (public)** — `fI_jax.TPInterpolationND(point)` from Python.
 #    Includes input validation, range checks, and the fixed Python-to-compiled
-#    dispatch cost. The compute inside is a few hundred nanoseconds; the
-#    ~10-20 µs you see is almost entirely dispatch overhead.
+#    dispatch cost. The compute inside is a few hundred nanoseconds;
+#    essentially everything you see is dispatch and synchronization overhead
+#    (tens of microseconds on a CPU-only install, up to a millisecond when a
+#    GPU backend is active).
 #  * **JAX inside jit** — the same evaluation embedded in a compiled caller
 #    (here amortized over a 512-point batch, i.e. the per-point cost when the
 #    spline lives inside a jitted model). This is the number that matters in
 #    a JAX codebase.
+#
+# On the GPU, a single-point call from Python additionally pays host-to-device
+# transfer of the point and device-to-host transfer of the result — expect
+# GPU single-point latency to be the *worst* of all rows. GPUs earn their keep
+# on batches (5.3) and on large grids (section 6), never on isolated points.
 #
 # One honest footnote about the "warmup" rows below: compiled programs are
 # cached per function and input shape for the life of the process, and this
@@ -506,18 +600,21 @@ print(f"coefficient solve only:  GSL {gsl_solve:7.3f} ms | JAX {jax_solve:7.3f} 
 # %%
 gsl_single = median_ms(fI_gsl.TPInterpolationND, point, repeat=100)
 
-jax_single_warmup = once_ms(fI_jax.TPInterpolationND, point)  # includes compile
-jax_single = median_ms(fI_jax.TPInterpolationND, point, repeat=100)
-
-batch_warmup = once_ms(fI_jax.TPInterpolationND_batched, points_batch)
-jax_batch = median_ms(fI_jax.TPInterpolationND_batched, points_batch, repeat=50)
-jax_per_point_in_jit = jax_batch / len(points_batch)
-
+jax_single = {}
+jax_batch = {}
 print("single-point evaluation, 3D:")
-print(f"  GSL single                {gsl_single*1e3:9.2f} us")
-print(f"  JAX single warmup         {jax_single_warmup:9.2f} ms   (cache hit; see note above)")
-print(f"  JAX single (public call)  {jax_single*1e3:9.2f} us")
-print(f"  JAX per point inside jit  {jax_per_point_in_jit*1e3:9.2f} us   (from 512-pt batch)")
+print(f"  GSL single                     {gsl_single*1e3:9.2f} us")
+for dev_name, fI in fI_jax_dev.items():
+    warmup = once_ms(fI.TPInterpolationND, point)
+    jax_single[dev_name] = median_ms(fI.TPInterpolationND, point, repeat=100)
+    once_ms(fI.TPInterpolationND_batched, points_batch)  # warmup the batched call
+    jax_batch[dev_name] = median_ms(fI.TPInterpolationND_batched, points_batch, repeat=50)
+    per_point_in_jit = jax_batch[dev_name] / len(points_batch)
+    print(f"  JAX {dev_name}: single warmup       {warmup:9.2f} ms   (cache hit; see note above)")
+    print(f"  JAX {dev_name}: single (public)     {jax_single[dev_name]*1e3:9.2f} us")
+    print(f"  JAX {dev_name}: per point inside jit{per_point_in_jit*1e3:9.2f} us   (from 512-pt batch)")
+if gpu_device is None:
+    gpu_skip_message()
 
 # %% [markdown]
 # **How to read this:** for isolated single points from Python, GSL wins —
@@ -540,8 +637,11 @@ gsl_batch = median_ms(fI_gsl.TPInterpolationND_batched, points_batch, repeat=50)
 print(f"512-point batch, 3D:")
 print(f"  GSL python loop           {gsl_loop:9.3f} ms  ({gsl_loop/512*1e3:6.2f} us/point)")
 print(f"  GSL batched               {gsl_batch:9.3f} ms  ({gsl_batch/512*1e3:6.2f} us/point)")
-print(f"  JAX warmup                {batch_warmup:9.3f} ms   (cache hit; see note above)")
-print(f"  JAX vmap batch            {jax_batch:9.3f} ms  ({jax_batch/512*1e3:6.2f} us/point)")
+for dev_name in fI_jax_dev:
+    print(f"  JAX {dev_name} vmap batch        {jax_batch[dev_name]:9.3f} ms  "
+          f"({jax_batch[dev_name]/512*1e3:6.2f} us/point)")
+if gpu_device is None:
+    gpu_skip_message()
 print(f"  GSL batched vs loop       {gsl_loop/gsl_batch:9.1f}x")
 print(f"  accuracy: max |GSL batched - JAX batch| = "
       f"{np.max(np.abs(np.asarray(fI_gsl.TPInterpolationND_batched(points_batch)) - np.asarray(fI_jax.TPInterpolationND_batched(points_batch)))):.2e}")
@@ -558,6 +658,12 @@ print(f"  accuracy: max |GSL batched - JAX batch| = "
 # compiled JAX kernel vectorizes *across* points and pulls ahead for large
 # batches in higher dimensions. Both agree to ~1e-14, so from plain Python
 # simply use the batched call of whichever backend you already hold.
+#
+# The GPU row includes transferring the 512 points to the device and the
+# results back — at this batch size that overhead usually still dominates, so
+# the GPU only overtakes the CPU rows for much larger batches (or when the
+# points already live on the GPU inside a jitted pipeline, where no transfer
+# happens at all).
 
 # %% [markdown]
 # ### 5.4 Gradients
@@ -568,9 +674,13 @@ print(f"  accuracy: max |GSL batched - JAX batch| = "
 # compiled call, batched over all points.
 
 # %%
-grad_batch_fn = jax.jit(jax.vmap(jax.grad(fI_jax.TPInterpolationND)))
-grad_warmup = once_ms(grad_batch_fn, pts_dev)
-grad_batch = median_ms(grad_batch_fn, pts_dev, repeat=50)
+jax_grad = {}
+jax_grad_warmup = {}
+for dev_name, fI in fI_jax_dev.items():
+    grad_batch_fn = jax.jit(jax.vmap(jax.grad(fI.TPInterpolationND)))
+    pts_on_dev = jax.device_put(jnp.asarray(points_batch), jax_devices[dev_name])
+    jax_grad_warmup[dev_name] = once_ms(grad_batch_fn, pts_on_dev)
+    jax_grad[dev_name] = median_ms(grad_batch_fn, pts_on_dev, repeat=50)
 
 fd_batch = median_ms(
     lambda pts: np.array(
@@ -589,8 +699,12 @@ fd_batch = median_ms(
 
 print("gradients at 512 points, 3D:")
 print(f"  GSL finite differences    {fd_batch:9.3f} ms  (approximate)")
-print(f"  JAX grad warmup           {grad_warmup:9.3f} ms   (genuine first-time compile)")
-print(f"  JAX vmap(grad) batch      {grad_batch:9.3f} ms  (exact)")
+for dev_name in fI_jax_dev:
+    print(f"  JAX {dev_name} grad warmup       {jax_grad_warmup[dev_name]:9.3f} ms   "
+          f"(genuine first-time compile)")
+    print(f"  JAX {dev_name} vmap(grad) batch  {jax_grad[dev_name]:9.3f} ms  (exact)")
+if gpu_device is None:
+    gpu_skip_message()
 
 # %% [markdown]
 # ### 5.5 Vector-valued evaluation
@@ -609,15 +723,23 @@ gsl_scalar_x3 = median_ms(
     lambda p: [comp.TPInterpolationND(p) for comp in gsl_scalar_components], point, repeat=100
 )
 
-vec_warmup = once_ms(fI_vec.TPInterpolationND, point)
-vec_single = median_ms(fI_vec.TPInterpolationND, point, repeat=100)
-scalar_x3 = 3 * jax_single
+# per-device JAX vector interpolants, reused in the batched cell below
+fI_vec_dev = {}
+for dev_name, dev in jax_devices.items():
+    with jax.default_device(dev):
+        fI_vec_dev[dev_name] = TPI_jax.TP_Interpolant_ND_Vector(
+            nodes, values_shape=(3,), F=F_vec)
 
 print("3-component vector spline, 3D, single point from Python:")
 print(f"  GSL 1 vector eval         {gsl_vec_single*1e3:9.2f} us")
 print(f"  GSL 3 scalar evals        {gsl_scalar_x3*1e3:9.2f} us")
-print(f"  JAX 1 vector eval         {vec_single*1e3:9.2f} us")
-print(f"  JAX 3 scalar evals        {scalar_x3*1e3:9.2f} us")
+for dev_name, fI in fI_vec_dev.items():
+    once_ms(fI.TPInterpolationND, point)  # warmup
+    vec_single = median_ms(fI.TPInterpolationND, point, repeat=100)
+    print(f"  JAX {dev_name} 1 vector eval     {vec_single*1e3:9.2f} us")
+    print(f"  JAX {dev_name} 3 scalar evals    {3*jax_single[dev_name]*1e3:9.2f} us")
+if gpu_device is None:
+    gpu_skip_message()
 
 # %% [markdown]
 # The GSL vector evaluation costs barely more than a *single* scalar call —
@@ -649,19 +771,23 @@ print(f"  speedup                   {gsl_scalar_x100/gsl_vec100:9.1f}x")
 
 # %%
 gsl_vec_batch = median_ms(fI_vec_gsl.TPInterpolationND_batched, points_batch, repeat=50)
-vec_batch_warmup = once_ms(fI_vec.TPInterpolationND_batched, points_batch)
-jax_vec_batch = median_ms(fI_vec.TPInterpolationND_batched, points_batch, repeat=50)
 print("3-component vector spline, 512-point batch:")
 print(f"  GSL batched               {gsl_vec_batch:9.3f} ms  -> shape {np.asarray(fI_vec_gsl.TPInterpolationND_batched(points_batch)).shape}")
-print(f"  JAX warmup                {vec_batch_warmup:9.3f} ms")
-print(f"  JAX vmap batch            {jax_vec_batch:9.3f} ms")
+for dev_name, fI in fI_vec_dev.items():
+    warmup = once_ms(fI.TPInterpolationND_batched, points_batch)
+    jax_vec_batch = median_ms(fI.TPInterpolationND_batched, points_batch, repeat=50)
+    print(f"  JAX {dev_name} warmup            {warmup:9.3f} ms")
+    print(f"  JAX {dev_name} vmap batch        {jax_vec_batch:9.3f} ms")
+if gpu_device is None:
+    gpu_skip_message()
 
 # %% [markdown]
 # ### 5.6 Takeaways
 #
 #  * **Construction** costs are comparable; both are one-time costs.
 #  * **One-at-a-time Python calls:** Cython/GSL is the right tool
-#    (microseconds vs tens of microseconds).
+#    (microseconds, vs tens of microseconds for JAX on a CPU-only install
+#    and up to a millisecond with a GPU backend active).
 #  * **Batches:** never loop over points in Python — both backends provide
 #    `TPInterpolationND_batched` (also reachable as `fI(points)`). The GSL
 #    batch is a single GIL-releasing C loop and wins small-to-medium batches;
@@ -670,9 +796,16 @@ print(f"  JAX vmap batch            {jax_vec_batch:9.3f} ms")
 #  * **Inside a JAX model:** embedding the interpolant in jitted code makes
 #    its per-point cost sub-microsecond and gives you exact gradients for
 #    free — this is the setting the JAX backend was built for.
-#  * **First calls are slow by design** (compilation). If your process is
-#    short-lived and calls the spline only a few times, that warmup may
-#    dominate; long-running analyses amortize it to nothing.
+#  * **CPU vs GPU:** the GPU never wins isolated single points (host-device
+#    transfer dominates), usually loses small batches too, and pulls ahead as
+#    the work grows — very large batches, large grids (section 6), or when
+#    the interpolant is embedded in a pipeline whose data already lives on
+#    the GPU. On CPU-only machines everything above still runs, just without
+#    the GPU rows.
+#  * **First calls are slow by design** (compilation, once per function,
+#    input shape, *and device*). If your process is short-lived and calls
+#    the spline only a few times, that warmup may dominate; long-running
+#    analyses amortize it to nothing.
 #  * **Vector-valued splines** share all per-point bookkeeping across
 #    components — prefer one vector interpolant over M scalar ones, in either
 #    backend. For one-at-a-time vector values from Python, the GSL
@@ -710,9 +843,13 @@ t0 = time.perf_counter()
 fI_large = TPI.TP_Interpolant_ND([x_large], F=F_large)
 print(f"GSL general path, n={n_large}: {(time.perf_counter()-t0)*1e3:.0f} ms")
 
-t0 = time.perf_counter()
-fI_large_jax = TPI_jax.TP_Interpolant_ND([x_large], F=F_large)
-print(f"JAX general path, n={n_large}: {(time.perf_counter()-t0)*1e3:.0f} ms")
+for dev_name, dev in jax_devices.items():
+    t0 = time.perf_counter()
+    with jax.default_device(dev):
+        fI_large_jax = TPI_jax.TP_Interpolant_ND([x_large], F=F_large)
+    print(f"JAX general path on {dev_name}, n={n_large}: {(time.perf_counter()-t0)*1e3:.0f} ms")
+if gpu_device is None:
+    gpu_skip_message()
 
 # %% [markdown]
 # ### 6.2 `Spline1D`: the dedicated 1D class
@@ -723,9 +860,14 @@ print(f"JAX general path, n={n_large}: {(time.perf_counter()-t0)*1e3:.0f} ms")
 #
 #  * **Construction** solves the classic *tridiagonal* not-a-knot system for
 #    the node derivatives — no search anywhere, the sortedness of the node
-#    array is used to the fullest. In the JAX backend the solve is
-#    `jax.lax.linalg.tridiagonal_solve`, so construction is jit-compatible
-#    and runs **entirely on the JAX device (GPU-capable, no host callback)**.
+#    array is used to the fullest. In the Cython/GSL backend the whole
+#    construction (validation, assembly, a pivoted LU solve, and the
+#    per-interval coefficients) is one fused C routine with the GIL
+#    released, and the data-independent LU factors are cached on the
+#    instance so refits on a fixed grid pay only the substitution. In the
+#    JAX backend the solve is `jax.lax.linalg.tridiagonal_solve`, so
+#    construction is jit-compatible and runs **entirely on the JAX device
+#    (GPU-capable, no host callback)**.
 #  * **Evaluation** works directly on the native per-interval (Hermite)
 #    representation. The Cython backend evaluates *sorted* query batches with
 #    a monotone span walk in C — O(M + n) instead of O(M log n) — and falls
@@ -737,11 +879,17 @@ print(f"JAX general path, n={n_large}: {(time.perf_counter()-t0)*1e3:.0f} ms")
 
 # %%
 s_gsl = TPI.Spline1D(x_large, F=F_large)
-s_jax = TPI_jax.Spline1D(x_large, F=F_large)
+
+s_jax_dev = {}
+for dev_name, dev in jax_devices.items():
+    with jax.default_device(dev):
+        s_jax_dev[dev_name] = TPI_jax.Spline1D(x_large, F=F_large)
+s_jax = s_jax_dev["gpu" if gpu_device is not None else "cpu"]
 
 xq_sorted = np.sort(rng.uniform(0.0, 100.0, 500_000))
 print("GSL Spline1D :", s_gsl(xq_sorted[:3]))
-print("JAX Spline1D :", np.asarray(s_jax(xq_sorted[:3])))
+for dev_name, s in s_jax_dev.items():
+    print(f"JAX Spline1D ({dev_name}):", np.asarray(s(xq_sorted[:3])))
 print("general path :", fI_large.TPInterpolationND_batched(xq_sorted[:3, None]))
 
 # %% [markdown]
@@ -751,11 +899,16 @@ print("general path :", fI_large.TPInterpolationND_batched(xq_sorted[:3, None]))
 
 # %%
 con_gsl_1d = median_ms(lambda: TPI.Spline1D(x_large, F=F_large), repeat=10)
-con_jax_1d = median_ms(lambda: TPI_jax.Spline1D(x_large, F=F_large).poly, repeat=10)
+con_jax_1d = {}
+for dev_name, dev in jax_devices.items():
+    with jax.default_device(dev):
+        con_jax_1d[dev_name] = median_ms(
+            lambda: TPI_jax.Spline1D(x_large, F=F_large).poly, repeat=10)
 con_gsl_gen = median_ms(lambda: TPI.TP_Interpolant_ND([x_large], F=F_large), repeat=10)
 
 ev_gsl_1d = median_ms(s_gsl, xq_sorted, repeat=10)
-ev_jax_1d = median_ms(s_jax, xq_sorted, repeat=10)
+ev_jax_1d = {name: median_ms(s, xq_sorted, repeat=10)
+             for name, s in s_jax_dev.items()}
 # The general path costs tens of microseconds *per point* on grids this
 # large, so it is timed on a 20k subset and scaled to the full batch size.
 subset = xq_sorted[::25][:, None]
@@ -763,18 +916,24 @@ ev_gsl_gen = median_ms(fI_large.TPInterpolationND_batched, subset, repeat=3)
 ev_gsl_gen_scaled = ev_gsl_gen * (len(xq_sorted) / len(subset))
 
 print(f"construction n={n_large}:")
-print(f"  Spline1D GSL {con_gsl_1d:8.1f} ms | Spline1D JAX {con_jax_1d:8.1f} ms "
-      f"| general GSL {con_gsl_gen:8.1f} ms")
+print(f"  Spline1D GSL {con_gsl_1d:8.1f} ms | general GSL {con_gsl_gen:8.1f} ms")
+for dev_name in jax_devices:
+    print(f"  Spline1D JAX on {dev_name} {con_jax_1d[dev_name]:8.1f} ms")
 print(f"evaluation of {len(xq_sorted)} sorted points:")
-print(f"  Spline1D GSL {ev_gsl_1d:8.1f} ms | Spline1D JAX {ev_jax_1d:8.1f} ms "
+print(f"  Spline1D GSL {ev_gsl_1d:8.1f} ms "
       f"| general GSL batched ~{ev_gsl_gen_scaled:8.0f} ms (scaled from 20k points)")
+for dev_name in jax_devices:
+    print(f"  Spline1D JAX on {dev_name} {ev_jax_1d[dev_name]:8.1f} ms")
+if gpu_device is None:
+    gpu_skip_message()
 
 # %% [markdown]
 # Just like `ComputeSplineCoefficientsND` on the general classes
 # (section 5.1), `Spline1D` can refit new data on the *fixed* grid without
 # reconstructing the object — `ComputeSplineCoefficients(F)`. The
-# data-independent tridiagonal system is cached on the instance, so a refit
-# skips validation and matrix assembly. On the JAX side this matters even
+# data-independent LU factorization of the tridiagonal system is cached on
+# the instance, so a refit skips validation, assembly, and factorization,
+# paying only the substitution. On the JAX side this matters even
 # more: each `Spline1D` instance carries its own compiled evaluator, and
 # refitting preserves it, while constructing a new instance forces a
 # recompile on the next evaluation (tens of milliseconds).
@@ -783,14 +942,19 @@ print(f"  Spline1D GSL {ev_gsl_1d:8.1f} ms | Spline1D JAX {ev_jax_1d:8.1f} ms "
 F2 = np.cos(0.2 * x_large) + 0.01 * x_large
 
 refit_gsl = median_ms(s_gsl.ComputeSplineCoefficients, F2, repeat=10)
-refit_jax = median_ms(lambda: (s_jax.ComputeSplineCoefficients(F2), s_jax.poly)[1], repeat=10)
 print(f"refit on fixed grid, n={n_large}:")
 print(f"  Spline1D GSL {refit_gsl:8.1f} ms (construction was {con_gsl_1d:.1f} ms)")
-print(f"  Spline1D JAX {refit_jax:8.1f} ms (construction was {con_jax_1d:.1f} ms, "
-      f"and the compiled evaluator survives)")
+for dev_name, s in s_jax_dev.items():
+    refit_jax = median_ms(
+        lambda: (s.ComputeSplineCoefficients(F2), s.poly)[1], repeat=10)
+    print(f"  Spline1D JAX on {dev_name} {refit_jax:8.1f} ms (construction was "
+          f"{con_jax_1d[dev_name]:.1f} ms, and the compiled evaluator survives)")
+if gpu_device is None:
+    gpu_skip_message()
 print("refit result:", np.asarray(s_gsl(xq_sorted[:3])))
 s_gsl.ComputeSplineCoefficients(F_large)  # restore for the cells below
-s_jax.ComputeSplineCoefficients(F_large)
+for s in s_jax_dev.values():
+    s.ComputeSplineCoefficients(F_large)
 
 # %% [markdown]
 # Accuracy is identical to the general path (same spline, different — and on
@@ -843,8 +1007,14 @@ print("jitted build+eval:", np.asarray(_)[:3])
 #
 # ```python
 # # --- build ---
-# fI = TPI.TP_Interpolant_ND(nodes, F=F)          # Cython/GSL
-# fI = TPI_jax.TP_Interpolant_ND(nodes, F=F)      # JAX
+# fI = TPI.TP_Interpolant_ND(nodes, F=F)          # Cython/GSL (always CPU)
+# fI = TPI_jax.TP_Interpolant_ND(nodes, F=F)      # JAX, on the default device
+#
+# # --- JAX device control (GPU machines default to the GPU) ---
+# gpu = jax.devices("gpu")[0]                     # RuntimeError if no GPU
+# with jax.default_device(gpu):                   # pin a spline to a device
+#     fI_gpu = TPI_jax.TP_Interpolant_ND(nodes, F=F)
+# xs_gpu = jax.device_put(xs, gpu)                # move points to the device
 #
 # # --- save / restore (backend-agnostic) ---
 # c = np.asarray(fI.GetSplineCoefficientsND())
