@@ -24,6 +24,9 @@
 
 #define TPI_FAIL -1
 #define TPI_SUCCESS 0
+#define TPI_ERR_NODES_NOT_FINITE -2
+#define TPI_ERR_NODES_NOT_INCREASING -3
+#define TPI_ERR_SINGULAR -4
 
 #define CHECK_RANGES
 
@@ -130,6 +133,51 @@ int Spline_1D_Batch_Sorted(
     double *xq,                         // Input: M non-decreasing, in-range query points
     int M,                              // Input: number of query points
     double *y                           // Output: spline evaluated at the M points
+);
+
+int Spline_1D_NotAKnot_Factor(
+    const double *x,                    // Input: strictly increasing nodes, length n (n >= 4)
+    int n,                              // Input: number of nodes
+    double *dx,                         // Output: node spacings, length n-1
+    double *dl,                         // Output: LU subdiagonal multipliers, length n-1
+    double *d,                          // Output: diagonal of U, length n
+    double *du,                         // Output: first superdiagonal of U, length n-1
+    double *du2,                        // Output: second superdiagonal fill-in, length n-2
+    int *piv                            // Output: pivot flags, length n-1 (1 = rows swapped)
+);
+
+int Spline_1D_NotAKnot_Refit(
+    const double *x,                    // Input: nodes (only the boundary widths are read)
+    const double *dx,                   // Input: node spacings from Factor
+    int n,                              // Input: number of nodes
+    const double *dl,                   // Input: LU factors from Factor
+    const double *d,
+    const double *du,
+    const double *du2,
+    const int *piv,
+    const double *f,                    // Input: data values at the nodes, length n
+    double *work,                       // Work: length n (RHS, then node derivatives)
+    double *c0,                         // Output: per-interval cubic coefficients, length n-1
+    double *c1,                         //        (value, 1st, 2nd, 3rd order terms in t = xq - x[i])
+    double *c2,
+    double *c3
+);
+
+int Spline_1D_NotAKnot_Construct(       // Factor followed by Refit on the same buffers
+    const double *x,
+    const double *f,
+    int n,
+    double *dx,
+    double *dl,
+    double *d,
+    double *du,
+    double *du2,
+    int *piv,
+    double *work,
+    double *c0,
+    double *c1,
+    double *c2,
+    double *c3
 );
 
 int TP_Interpolation_ND_Vector_Batch(

@@ -19,6 +19,8 @@
 
 #include "TensorProductInterpolation.h"
 
+#include <math.h>
+
 #ifdef DEBUG
 #include <time.h>
 #include <stdio.h>
@@ -888,4 +890,164 @@ int Spline_1D_Batch_Sorted(
         y[k] = c0[j] + t * (c1[j] + t * (c2[j] + t * c3[j]));
     }
     return TPI_SUCCESS;
+}
+
+int Spline_1D_NotAKnot_Factor(
+    const double *x,
+    int n,
+    double *dx,
+    double *dl,
+    double *d,
+    double *du,
+    double *du2,
+    int *piv
+) {
+    // Assemble and LU-factor the tridiagonal system for the node derivatives
+    // of the 1D not-a-knot cubic interpolant (scipy CubicSpline formulation,
+    // identical to TPI_banded.spline1d_tridiagonal_system). Everything here
+    // depends only on the nodes, so the factors can be cached and reused when
+    // refitting many datasets on one grid.
+
+    // Node spacings, fused with validation. Finiteness is reported before
+    // monotonicity, matching TPI_banded.validate_spline1d_nodes; the
+    // !(dx > 0) test also catches NaN spacings.
+    int nonfinite = !isfinite(x[0]);
+    int nonincreasing = 0;
+    for (int i = 0; i < n - 1; i++) {
+        if (!isfinite(x[i + 1]))
+            nonfinite = 1;
+        dx[i] = x[i + 1] - x[i];
+        if (!(dx[i] > 0.0))
+            nonincreasing = 1;
+    }
+    if (nonfinite)
+        return TPI_ERR_NODES_NOT_FINITE;
+    if (nonincreasing)
+        return TPI_ERR_NODES_NOT_INCREASING;
+
+    d[0] = dx[1];
+    du[0] = x[2] - x[0];
+    for (int i = 1; i < n - 1; i++) {
+        dl[i - 1] = dx[i];
+        d[i] = 2.0 * (dx[i - 1] + dx[i]);
+        du[i] = dx[i - 1];
+    }
+    dl[n - 2] = x[n - 1] - x[n - 3];
+    d[n - 1] = dx[n - 3];
+
+    // Tridiagonal LU with partial pivoting (LAPACK dgttrf scheme). The
+    // not-a-knot boundary rows are not diagonally dominant, so a plain
+    // Thomas elimination is not stable on adversarial node spacings.
+    for (int i = 0; i < n - 1; i++) {
+        if (fabs(d[i]) >= fabs(dl[i])) {
+            piv[i] = 0;
+            if (d[i] == 0.0)
+                return TPI_ERR_SINGULAR;
+            const double fact = dl[i] / d[i];
+            dl[i] = fact;
+            d[i + 1] -= fact * du[i];
+            if (i < n - 2)
+                du2[i] = 0.0;
+        } else {
+            piv[i] = 1;
+            const double fact = d[i] / dl[i];
+            d[i] = dl[i];
+            dl[i] = fact;
+            const double temp = du[i];
+            du[i] = d[i + 1];
+            d[i + 1] = temp - fact * d[i + 1];
+            if (i < n - 2) {
+                du2[i] = du[i + 1];
+                du[i + 1] = -fact * du[i + 1];
+            }
+        }
+    }
+    if (d[n - 1] == 0.0)
+        return TPI_ERR_SINGULAR;
+    return TPI_SUCCESS;
+}
+
+int Spline_1D_NotAKnot_Refit(
+    const double *x,
+    const double *dx,
+    int n,
+    const double *dl,
+    const double *d,
+    const double *du,
+    const double *du2,
+    const int *piv,
+    const double *f,
+    double *work,
+    double *c0,
+    double *c1,
+    double *c2,
+    double *c3
+) {
+    // Solve for the node derivatives of the not-a-knot interpolant of f using
+    // the cached LU factors, then fill the per-interval cubic coefficients
+    // (identical arithmetic to TPI_banded.spline1d_derivatives_notaknot and
+    // TPI_banded.hermite_polynomial_pieces).
+    const double d_left = x[2] - x[0];
+    const double d_right = x[n - 1] - x[n - 3];
+
+    // Interval slopes, staged in c3 until the cubic coefficients overwrite it.
+    for (int i = 0; i < n - 1; i++)
+        c3[i] = (f[i + 1] - f[i]) / dx[i];
+
+    work[0] = ((dx[0] + 2.0 * d_left) * dx[1] * c3[0]
+               + dx[0] * dx[0] * c3[1]) / d_left;
+    for (int i = 1; i < n - 1; i++)
+        work[i] = 3.0 * (dx[i] * c3[i - 1] + dx[i - 1] * c3[i]);
+    work[n - 1] = (dx[n - 2] * dx[n - 2] * c3[n - 3]
+                   + (2.0 * d_right + dx[n - 2]) * dx[n - 3] * c3[n - 2]) / d_right;
+
+    // Forward and back substitution (LAPACK dgtts2 scheme).
+    for (int i = 0; i < n - 1; i++) {
+        if (piv[i] == 0) {
+            work[i + 1] -= dl[i] * work[i];
+        } else {
+            const double temp = work[i];
+            work[i] = work[i + 1];
+            work[i + 1] = temp - dl[i] * work[i];
+        }
+    }
+    work[n - 1] /= d[n - 1];
+    work[n - 2] = (work[n - 2] - du[n - 2] * work[n - 1]) / d[n - 2];
+    for (int i = n - 3; i >= 0; i--)
+        work[i] = (work[i] - du[i] * work[i + 1] - du2[i] * work[i + 2]) / d[i];
+
+    for (int i = 0; i < n - 1; i++) {
+        const double slope = c3[i];
+        c0[i] = f[i];
+        c1[i] = work[i];
+        c2[i] = (3.0 * slope - 2.0 * work[i] - work[i + 1]) / dx[i];
+        c3[i] = (work[i] + work[i + 1] - 2.0 * slope) / (dx[i] * dx[i]);
+    }
+    return TPI_SUCCESS;
+}
+
+int Spline_1D_NotAKnot_Construct(
+    const double *x,
+    const double *f,
+    int n,
+    double *dx,
+    double *dl,
+    double *d,
+    double *du,
+    double *du2,
+    int *piv,
+    double *work,
+    double *c0,
+    double *c1,
+    double *c2,
+    double *c3
+) {
+    // One-shot construction: Factor then Refit on the same buffers, so a
+    // later refit on the cached factors is bitwise identical to a fresh
+    // construction by definition.
+    int ret = Spline_1D_NotAKnot_Factor(x, n, dx, dl, d, du, du2, piv);
+    if (ret != TPI_SUCCESS)
+        return ret;
+    return Spline_1D_NotAKnot_Refit(x, dx, n, dl, d, du, du2, piv, f, work,
+                                    c0, c1, c2, c3);
 }

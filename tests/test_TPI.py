@@ -2770,6 +2770,88 @@ def test_Spline1D_recompute_coefficients_on_fixed_grid():
             spline.ComputeSplineCoefficients(np.zeros(len(x) + 1))
 
 
+def test_gsl_Spline1D_pivoting_stress_grid():
+    """Adversarial node spacings exercise the pivoted tridiagonal solve.
+
+    Log-uniform spacings spanning ~11 orders of magnitude. The not-a-knot
+    boundary rows are not diagonally dominant, so a non-pivoting Thomas
+    solve loses digits here (measured ~4e-8 relative error on this grid);
+    a partial-pivoting solve (same algorithm class as scipy's dgtsv) must
+    stay at scipy-parity accuracy.
+    """
+    from scipy.interpolate import CubicSpline
+
+    rng = np.random.default_rng(96)
+    n = int(rng.integers(6, 400))
+    span = float(rng.uniform(4, 14))
+    dx = 10.0 ** rng.uniform(-span, 0.0, n - 1)
+    x = np.concatenate(([0.0], np.cumsum(dx)))
+    assert np.all(np.diff(x) > 0)
+    F = rng.standard_normal(n)
+    spline = TPI.Spline1D(x, F=F)
+    reference = CubicSpline(x, F, bc_type="not-a-knot")
+
+    xq = np.sort(rng.uniform(x[0], x[-1], 50))
+    actual = np.asarray(spline(xq))
+    expected = reference(xq)
+    scale = max(1.0, np.max(np.abs(expected)))
+    _print_coefficient_diffs(actual, expected)
+    assert np.max(np.abs(actual - expected)) / scale < 1e-10
+
+    # refitting on the stress grid matches a fresh instance exactly
+    F2 = rng.standard_normal(n)
+    spline.ComputeSplineCoefficients(F2)
+    fresh = TPI.Spline1D(x, F=F2)
+    assert np.array_equal(np.asarray(spline(xq)), np.asarray(fresh(xq)))
+
+
+def test_gsl_Spline1D_large_n_scipy_parity():
+    from scipy.interpolate import CubicSpline
+
+    x = np.unique(np.concatenate(([0.0], np.geomspace(1e-6, 1.0, 50_000))))
+    F = np.sin(20.0 * x) * np.exp(-x)
+    spline = TPI.Spline1D(x, F=F)
+    reference = CubicSpline(x, F, bc_type="not-a-knot")
+
+    xq = np.sort(np.random.default_rng(42).uniform(x[0], x[-1], 30))
+    actual = np.asarray(spline(xq))
+    expected = reference(xq)
+    _print_coefficient_diffs(actual, expected)
+    assert np.allclose(actual, expected, atol=1e-10, rtol=0)
+
+    coeffs = np.asarray(spline.to_coefficients())
+    assert coeffs.shape == (len(x) + 2,)
+    roundtrip = TPI.Spline1D(x, coeffs=coeffs)
+    rt = np.asarray(roundtrip(xq))
+    _print_coefficient_diffs(rt, actual)
+    assert np.allclose(rt, actual, atol=1e-10, rtol=0)
+
+
+def test_gsl_Spline1D_node_validation_messages():
+    """Exact validation errors on the F construction path.
+
+    Finiteness is reported before monotonicity when both are violated, and
+    NaN in the data values (as opposed to the nodes) is not validated.
+    """
+    x = np.linspace(0.0, 1.0, 10)
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        TPI.Spline1D(np.array([0.0, 1.0, 0.5, 2.0]), F=np.zeros(4))
+    with pytest.raises(ValueError, match="must be finite"):
+        TPI.Spline1D(np.array([0.0, 1.0, np.nan, 2.0]), F=np.zeros(4))
+    with pytest.raises(ValueError, match="must be finite"):
+        TPI.Spline1D(np.array([0.0, np.inf, 1.0, 0.5]), F=np.zeros(4))
+    with pytest.raises(ValueError, match="one-dimensional"):
+        TPI.Spline1D(np.zeros((4, 2)), F=np.zeros(8))
+    with pytest.raises(ValueError, match="at least four"):
+        TPI.Spline1D(np.array([0.0, 1.0, 2.0]), F=np.zeros(3))
+
+    # NaN in F does not raise; it propagates like in the previous solver
+    nan_F = np.sin(x)
+    nan_F[3] = np.nan
+    TPI.Spline1D(x, F=nan_F)
+
+
 # Hack for running tests since pytest does not import the Cython module under python3
 # Just run: python3 test.py
 '''

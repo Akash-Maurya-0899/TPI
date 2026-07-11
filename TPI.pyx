@@ -42,6 +42,9 @@ cdef extern from "gsl/gsl_bspline.h":
 
 cdef extern from "TensorProductInterpolation.h":
     cdef int TPI_FAIL;
+    cdef int TPI_SUCCESS;
+    cdef int TPI_ERR_NODES_NOT_FINITE;
+    cdef int TPI_ERR_NODES_NOT_INCREASING;
 
     ctypedef struct array:
         double *vec;
@@ -127,6 +130,34 @@ cdef extern from "TensorProductInterpolation.h":
         double *xq,
         int M,
         double *y
+    ) nogil;
+
+    int Spline_1D_NotAKnot_Factor(
+        const double *x,
+        int n,
+        double *dx,
+        double *dl,
+        double *d,
+        double *du,
+        double *du2,
+        int *piv
+    ) nogil;
+
+    int Spline_1D_NotAKnot_Refit(
+        const double *x,
+        const double *dx,
+        int n,
+        const double *dl,
+        const double *d,
+        const double *du,
+        const double *du2,
+        const int *piv,
+        const double *f,
+        double *work,
+        double *c0,
+        double *c1,
+        double *c2,
+        double *c3
     ) nogil;
 
     int AssembleSplineMatrix_C(
@@ -765,8 +796,9 @@ cdef class Spline1D:
     """Dedicated fast 1D cubic spline (not-a-knot) in native Hermite form.
 
     Construction solves the classic tridiagonal system for the node
-    derivatives (O(n) time and memory, no search anywhere) and stores
-    per-interval polynomial coefficients. Evaluation of a sorted batch of
+    derivatives in C (O(n) time and memory, LU with partial pivoting, GIL
+    released, no search anywhere) and stores per-interval polynomial
+    coefficients. Evaluation of a sorted batch of
     query points uses a monotone span walk in C (O(M + n), GIL released);
     unsorted batches fall back to a vectorized binary search. Nodes must be
     strictly increasing with at least 4 points.
@@ -779,7 +811,7 @@ cdef class Spline1D:
     """
 
     cdef x_arr, c0, c1, c2, c3
-    cdef _system
+    cdef _factors
     cdef int n
     cdef double _x_min, _x_max
 
@@ -794,35 +826,75 @@ cdef class Spline1D:
                     GetSplineCoefficientsND() or to_coefficients().
 
         """
-        x_np = TPI_banded.validate_spline1d_nodes(x)
+        x_np = np.asarray(x, dtype=np.double)
+        if x_np.ndim != 1:
+            raise ValueError("Input nodes must be one-dimensional.")
+        if x_np.shape[0] < 4:
+            raise ValueError("Require at least four input nodes for Spline1D.")
         self.x_arr = np.ascontiguousarray(x_np)
         self.n = x_np.shape[0]
         self._x_min = x_np[0]
         self._x_max = x_np[-1]
         self.c0 = None
-        self._system = None
+        self._factors = None
         if F is not None and coeffs is not None:
             raise ValueError("Pass either F or coeffs, not both.")
         if F is not None:
+            # finiteness and monotonicity of the nodes are validated inside
+            # the C factorization pass
             self.ComputeSplineCoefficients(F)
-        elif coeffs is not None:
-            coeffs_np = np.asarray(coeffs, dtype=np.double)
-            if coeffs_np.shape != (self.n + 2,):
-                raise ValueError(
-                    "Spline coefficients should have shape [%d]" % (self.n + 2))
-            f, s = TPI_banded.bspline_to_hermite(x_np, coeffs_np)
-            self._set_pieces(TPI_banded.hermite_polynomial_pieces(x_np, f, s))
+        else:
+            TPI_banded.validate_spline1d_nodes(x_np)
+            if coeffs is not None:
+                coeffs_np = np.asarray(coeffs, dtype=np.double)
+                if coeffs_np.shape != (self.n + 2,):
+                    raise ValueError(
+                        "Spline coefficients should have shape [%d]" % (self.n + 2))
+                f, s = TPI_banded.bspline_to_hermite(x_np, coeffs_np)
+                self._set_pieces(TPI_banded.hermite_polynomial_pieces(x_np, f, s))
 
     def _set_pieces(self, pieces):
         self.c0, self.c1, self.c2, self.c3 = [
             np.ascontiguousarray(c, dtype=np.double) for c in pieces]
 
+    def _factor_nodes(self):
+        """Assemble and LU-factor the tridiagonal node-derivative system in C.
+
+        The factors depend only on the nodes and are cached on this instance.
+        Node validation (finiteness, strict monotonicity) happens inside the
+        same C pass over the nodes.
+
+        """
+        cdef np.ndarray[np.double_t, ndim=1] x_c = self.x_arr
+        cdef np.ndarray[np.double_t, ndim=1] dx = np.empty(self.n - 1, dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=1] dl = np.empty(self.n - 1, dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=1] d = np.empty(self.n, dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=1] du = np.empty(self.n - 1, dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=1] du2 = np.empty(self.n - 2, dtype=np.double)
+        cdef np.ndarray[np.int32_t, ndim=1] piv = np.empty(self.n - 1, dtype=np.intc)
+        cdef np.ndarray[np.double_t, ndim=1] work = np.empty(self.n, dtype=np.double)
+        cdef int n = self.n
+        cdef int ret
+        with nogil:
+            ret = Spline_1D_NotAKnot_Factor(<double*> x_c.data, n,
+                                            <double*> dx.data, <double*> dl.data,
+                                            <double*> d.data, <double*> du.data,
+                                            <double*> du2.data, <int*> piv.data)
+        if ret == TPI_ERR_NODES_NOT_FINITE:
+            raise ValueError("Input nodes must be finite.")
+        if ret == TPI_ERR_NODES_NOT_INCREASING:
+            raise ValueError("Input nodes must be strictly increasing for Spline1D.")
+        if ret != TPI_SUCCESS:
+            raise ValueError("Spline1D: singular tridiagonal system.")
+        self._factors = (dx, dl, d, du, du2, piv, work)
+
     def ComputeSplineCoefficients(self, F):
         """Compute the spline for data F on the stored node grid.
 
-        The data-independent tridiagonal system is cached on this instance,
-        so refitting many datasets on one grid skips node validation and
-        matrix assembly and only pays the O(n) solve.
+        The data-independent LU factorization of the tridiagonal system is
+        cached on this instance, so refitting many datasets on one grid skips
+        node validation and matrix assembly and only pays the O(n)
+        substitution. Everything runs in C with the GIL released.
 
         Arguments:
           * F: data values at the nodes, shape (len(x),).
@@ -831,11 +903,31 @@ cdef class Spline1D:
         F_np = np.asarray(F, dtype=np.double)
         if F_np.shape != (self.n,):
             raise ValueError("Data should have shape [%d]" % self.n)
-        if self._system is None:
-            self._system = TPI_banded.spline1d_tridiagonal_system(self.x_arr)
-        s = TPI_banded.spline1d_derivatives_notaknot(self.x_arr, F_np,
-                                                     system=self._system)
-        self._set_pieces(TPI_banded.hermite_polynomial_pieces(self.x_arr, F_np, s))
+        if self._factors is None:
+            self._factor_nodes()
+        cdef np.ndarray[np.double_t, ndim=1] f_c = np.ascontiguousarray(F_np)
+        cdef np.ndarray[np.double_t, ndim=1] x_c = self.x_arr
+        cdef np.ndarray[np.double_t, ndim=1] dx = self._factors[0]
+        cdef np.ndarray[np.double_t, ndim=1] dl = self._factors[1]
+        cdef np.ndarray[np.double_t, ndim=1] d = self._factors[2]
+        cdef np.ndarray[np.double_t, ndim=1] du = self._factors[3]
+        cdef np.ndarray[np.double_t, ndim=1] du2 = self._factors[4]
+        cdef np.ndarray[np.int32_t, ndim=1] piv = self._factors[5]
+        cdef np.ndarray[np.double_t, ndim=1] work = self._factors[6]
+        cdef np.ndarray[np.double_t, ndim=1] c0 = np.empty(self.n - 1, dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=1] c1 = np.empty(self.n - 1, dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=1] c2 = np.empty(self.n - 1, dtype=np.double)
+        cdef np.ndarray[np.double_t, ndim=1] c3 = np.empty(self.n - 1, dtype=np.double)
+        cdef int n = self.n
+        with nogil:
+            Spline_1D_NotAKnot_Refit(<double*> x_c.data, <double*> dx.data, n,
+                                     <double*> dl.data, <double*> d.data,
+                                     <double*> du.data, <double*> du2.data,
+                                     <int*> piv.data, <double*> f_c.data,
+                                     <double*> work.data,
+                                     <double*> c0.data, <double*> c1.data,
+                                     <double*> c2.data, <double*> c3.data)
+        self.c0, self.c1, self.c2, self.c3 = c0, c1, c2, c3
 
     def to_coefficients(self):
         """Standard TPI coefficient vector (shape (n + 2,)) of this spline."""
